@@ -19,6 +19,7 @@ find_package(OpenMP REQUIRED)
 
 set(FAISS_BASELINE_TARGETS
     faiss_ivfflat_lire_run_eval
+    faiss_lire_concurrent_eval
 )
 
 foreach(tgt IN LISTS FAISS_BASELINE_TARGETS)
@@ -26,7 +27,8 @@ foreach(tgt IN LISTS FAISS_BASELINE_TARGETS)
         src/${tgt}.cpp
     )
 
-    if(tgt STREQUAL "faiss_ivfflat_lire_run_eval")
+    if(tgt STREQUAL "faiss_ivfflat_lire_run_eval" OR
+       tgt STREQUAL "faiss_lire_concurrent_eval")
         target_sources(${tgt} PRIVATE
             src/faiss_ivfflat_lire.cpp
         )

@@ -2,6 +2,7 @@
 
 #include <faiss/IndexFlat.h>
 #include <faiss/invlists/InvertedLists.h>
+#include <faiss/utils/distances.h>
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +14,9 @@
 #include <random>
 #include <stdexcept>
 #include <unordered_set>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace baseline_eval {
 
@@ -119,16 +123,36 @@ IndexIVFFlatLIRE::IndexIVFFlatLIRE(int d, const LireConfig& config)
       initial_nlist_(config.initial_nlist),
       max_nlist_(config.max_nlist),
       centroids_(static_cast<size_t>(config.max_nlist) * d, 0.0f),
-      active_(config.max_nlist, 0) {
+      active_(config.max_nlist, 0),
+      list_generation_(config.max_nlist, 0),
+      maintenance_queued_or_running_(config.max_nlist, 0),
+      maintenance_request_ms_(config.max_nlist, 0.0) {
   if (d <= 0 || initial_nlist_ == 0 || max_nlist_ < initial_nlist_ ||
       config_.split_threshold < 2) {
     throw std::runtime_error("invalid IndexIVFFlatLIRE configuration");
   }
   own_fields = true;
   is_trained = false;
+  list_mutexes_.reserve(max_nlist_);
+  for (uint32_t i = 0; i < max_nlist_; ++i) {
+    list_mutexes_.push_back(std::make_unique<std::shared_mutex>());
+  }
+  maintenance_epoch_ = std::chrono::steady_clock::now();
 }
 
-IndexIVFFlatLIRE::~IndexIVFFlatLIRE() = default;
+IndexIVFFlatLIRE::~IndexIVFFlatLIRE() {
+  try {
+    stop_maintenance_workers();
+  } catch (...) {
+  }
+}
+
+std::shared_mutex& IndexIVFFlatLIRE::list_mutex(faiss::idx_t slot) const {
+  if (slot < 0 || slot >= static_cast<faiss::idx_t>(max_nlist_)) {
+    throw std::runtime_error("invalid LIRE list slot");
+  }
+  return *list_mutexes_[static_cast<size_t>(slot)];
+}
 
 IndexIVFFlatLIRE::ActiveCentroidIndex*
 IndexIVFFlatLIRE::active_quantizer() {
@@ -141,12 +165,7 @@ IndexIVFFlatLIRE::active_quantizer() const {
 }
 
 float IndexIVFFlatLIRE::l2(const float* a, const float* b) const {
-  float distance = 0.0f;
-  for (int j = 0; j < d; ++j) {
-    const float diff = a[j] - b[j];
-    distance += diff * diff;
-  }
-  return distance;
+  return faiss::fvec_L2sqr(a, b, static_cast<size_t>(d));
 }
 
 const float* IndexIVFFlatLIRE::centroid(faiss::idx_t slot) const {
@@ -242,7 +261,8 @@ bool IndexIVFFlatLIRE::split_balanced_kmeans(
   // This is the CPU/L2 specialization of SPFresh's Split() call to
   // KmeansClustering(K=2, samples=1000, lambdaFactor=100). The assignment
   // uses the same count penalty: L2(x, c_k) + lambda * previous_count[k].
-  std::mt19937 rng(config_.seed + static_cast<uint32_t>(split_serial_++));
+  const uint64_t serial = split_serial_.fetch_add(1, std::memory_order_relaxed);
+  std::mt19937 rng(config_.seed + static_cast<uint32_t>(serial));
   std::vector<size_t> order(n);
   std::iota(order.begin(), order.end(), 0);
   const size_t sample_n = std::min<size_t>(1000, n);
@@ -402,26 +422,31 @@ bool IndexIVFFlatLIRE::split_balanced_kmeans(
 }
 
 std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
-    faiss::idx_t slot) {
-  if (!active_[static_cast<size_t>(slot)] ||
-      invlists->list_size(static_cast<size_t>(slot)) <=
-          config_.split_threshold) {
-    return {};
-  }
-  if (free_slots_.empty()) {
-    throw std::runtime_error("LIRE max_nlist exhausted during split");
+    faiss::idx_t slot,
+    bool* did_split,
+    uint64_t* reassigned_vectors) {
+  *did_split = false;
+  *reassigned_vectors = 0;
+  ListData input;
+  std::vector<float> old_center;
+  std::vector<faiss::idx_t> neighbors;
+  uint64_t source_generation = 0;
+  {
+    std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+    if (!active_[static_cast<size_t>(slot)]) return {};
+    std::shared_lock<std::shared_mutex> list_lock(list_mutex(slot));
+    if (invlists->list_size(static_cast<size_t>(slot)) <=
+        config_.split_threshold) return {};
+    input = read_list(slot);
+    source_generation = list_generation_[static_cast<size_t>(slot)];
+    old_center.assign(centroid(slot), centroid(slot) + d);
+    neighbors = nearest_centroid_slots(old_center.data(), slot,
+                                       config_.reassign_k);
   }
 
-  ListData input = read_list(slot);
   std::vector<uint8_t> labels;
   std::vector<float> new_centers;
   if (!split_balanced_kmeans(input, &labels, &new_centers)) return {};
-
-  const std::vector<float> old_center(centroid(slot), centroid(slot) + d);
-  const std::vector<faiss::idx_t> neighbors = nearest_centroid_slots(
-      old_center.data(), slot, config_.reassign_k);
-  const faiss::idx_t new_slot = free_slots_.back();
-  free_slots_.pop_back();
 
   ListData children[2];
   children[0].ids.reserve(input.size());
@@ -436,22 +461,54 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
                                    vector, vector + d);
   }
 
-  // Commit the split while the global write lock is held. Search cannot see a
-  // centroid/list mismatch or a duplicate/missing vector during this phase.
-  write_list(slot, children[0]);
-  write_list(new_slot, children[1]);
-  std::copy(new_centers.begin(), new_centers.begin() + d, centroid(slot));
-  std::copy(new_centers.begin() + d, new_centers.end(), centroid(new_slot));
-  active_[static_cast<size_t>(new_slot)] = 1;
-  active_nlist_++;
-  for (faiss::idx_t id : children[0].ids) membership_[static_cast<size_t>(id)] = slot;
-  for (faiss::idx_t id : children[1].ids) membership_[static_cast<size_t>(id)] = new_slot;
-  split_count_++;
+  faiss::idx_t new_slot = -1;
+  {
+    // Follow SPFresh's per-posting synchronization model. The topology lock is
+    // held only for the short list/centroid publication, never for clustering.
+    std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
+    if (!active_[static_cast<size_t>(slot)] ||
+        list_generation_[static_cast<size_t>(slot)] != source_generation) {
+      return {slot};
+    }
+    if (free_slots_.empty()) {
+      throw std::runtime_error("LIRE max_nlist exhausted during split");
+    }
+    new_slot = free_slots_.back();
+    std::vector<faiss::idx_t> lock_slots{slot, new_slot};
+    std::sort(lock_slots.begin(), lock_slots.end());
+    std::vector<std::unique_lock<std::shared_mutex>> list_locks;
+    list_locks.reserve(lock_slots.size());
+    for (faiss::idx_t list : lock_slots) {
+      list_locks.emplace_back(list_mutex(list));
+    }
+    if (list_generation_[static_cast<size_t>(slot)] != source_generation) {
+      return {slot};
+    }
+    free_slots_.pop_back();
+    write_list(slot, children[0]);
+    write_list(new_slot, children[1]);
+    std::copy(new_centers.begin(), new_centers.begin() + d, centroid(slot));
+    std::copy(new_centers.begin() + d, new_centers.end(), centroid(new_slot));
+    active_[static_cast<size_t>(new_slot)] = 1;
+    active_nlist_++;
+    {
+      std::lock_guard<std::mutex> membership_lock(membership_mutex_);
+      for (faiss::idx_t id : children[0].ids)
+        membership_[static_cast<size_t>(id)] = slot;
+      for (faiss::idx_t id : children[1].ids)
+        membership_[static_cast<size_t>(id)] = new_slot;
+    }
+    ++list_generation_[static_cast<size_t>(slot)];
+    ++list_generation_[static_cast<size_t>(new_slot)];
+    ++split_count_;
+    rebuild_quantizer();
+  }
+  *did_split = true;
 
   std::vector<faiss::idx_t> changed{slot, new_slot};
   if (config_.enable_reassign) {
     std::vector<faiss::idx_t> moved_targets = collect_and_reassign(
-        slot, old_center, slot, new_slot, neighbors);
+        slot, old_center, slot, new_slot, neighbors, reassigned_vectors);
     changed.insert(changed.end(), moved_targets.begin(), moved_targets.end());
   }
   return changed;
@@ -462,7 +519,8 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
     const std::vector<float>& old_center,
     faiss::idx_t child0,
     faiss::idx_t child1,
-    const std::vector<faiss::idx_t>& neighbors) {
+    const std::vector<faiss::idx_t>& neighbors,
+    uint64_t* reassigned_vectors) {
   (void)old_slot;
   struct Candidate {
     faiss::idx_t id;
@@ -472,6 +530,43 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
 
   std::vector<Candidate> candidate_vectors;
   std::unordered_set<faiss::idx_t> candidate_ids;
+  std::vector<float> centroid_snapshot;
+  std::vector<uint8_t> active_snapshot;
+  std::unordered_map<faiss::idx_t, ListData> list_snapshots;
+  {
+    std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+    centroid_snapshot = centroids_;
+    active_snapshot = active_;
+    std::vector<faiss::idx_t> slots{child0, child1};
+    for (faiss::idx_t neighbor : neighbors) {
+      if (neighbor >= 0 && neighbor < static_cast<faiss::idx_t>(max_nlist_) &&
+          active_[static_cast<size_t>(neighbor)]) {
+        slots.push_back(neighbor);
+      }
+    }
+    std::sort(slots.begin(), slots.end());
+    slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+    std::vector<std::shared_lock<std::shared_mutex>> list_locks;
+    list_locks.reserve(slots.size());
+    for (faiss::idx_t list : slots) list_locks.emplace_back(list_mutex(list));
+    for (faiss::idx_t list : slots) list_snapshots.emplace(list, read_list(list));
+  }
+  const auto center_for = [&](faiss::idx_t list) {
+    return centroid_snapshot.data() + static_cast<size_t>(list) * d;
+  };
+  const auto nearest_snapshot = [&](const float* vector) {
+    faiss::idx_t best = -1;
+    float best_distance = std::numeric_limits<float>::infinity();
+    for (uint32_t candidate = 0; candidate < max_nlist_; ++candidate) {
+      if (!active_snapshot[candidate]) continue;
+      const float distance = l2(vector, center_for(candidate));
+      if (distance < best_distance) {
+        best_distance = distance;
+        best = static_cast<faiss::idx_t>(candidate);
+      }
+    }
+    return best;
+  };
   auto add_candidate = [&](faiss::idx_t id,
                            faiss::idx_t source,
                            const float* vector) {
@@ -484,13 +579,13 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
   };
 
   auto check_child = [&](faiss::idx_t child) {
-    ListData list = read_list(child);
+    const ListData& list = list_snapshots.at(child);
     for (size_t i = 0; i < list.size(); ++i) {
       const float* vector = list.row(i, d);
       reassign_scanned_++;
       // SPFresh CheckIsNeedReassign(..., isInSplitHead=true):
       // reject when D(v, old) >= D(v, current new head).
-      if (l2(vector, old_center.data()) >= l2(vector, centroid(child))) continue;
+      if (l2(vector, old_center.data()) >= l2(vector, center_for(child))) continue;
       add_candidate(list.ids[i], child, vector);
     }
   };
@@ -498,18 +593,18 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
   check_child(child1);
 
   for (faiss::idx_t neighbor : neighbors) {
-    if (!active_[static_cast<size_t>(neighbor)] || neighbor == child0 ||
+    if (!active_snapshot[static_cast<size_t>(neighbor)] || neighbor == child0 ||
         neighbor == child1) {
       continue;
     }
-    ListData list = read_list(neighbor);
+    const ListData& list = list_snapshots.at(neighbor);
     for (size_t i = 0; i < list.size(); ++i) {
       const float* vector = list.row(i, d);
       reassign_scanned_++;
       const float old_distance = l2(vector, old_center.data());
-      const float new0 = l2(vector, centroid(child0));
-      const float new1 = l2(vector, centroid(child1));
-      const float current = l2(vector, centroid(neighbor));
+      const float new0 = l2(vector, center_for(child0));
+      const float new1 = l2(vector, center_for(child1));
+      const float current = l2(vector, center_for(neighbor));
       // SPFresh CheckIsNeedReassign(..., isInSplitHead=false).
       if (old_distance <= new0 && old_distance <= new1) continue;
       if (current <= new0 && current <= new1) continue;
@@ -520,10 +615,7 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
   std::vector<Move> moves;
   moves.reserve(candidate_vectors.size());
   for (const Candidate& candidate : candidate_vectors) {
-    if (membership_[static_cast<size_t>(candidate.id)] != candidate.source) {
-      throw std::runtime_error("LIRE membership changed during reassign scan");
-    }
-    const faiss::idx_t target = nearest_active(candidate.vector.data());
+    const faiss::idx_t target = nearest_snapshot(candidate.vector.data());
     if (target == candidate.source) continue;
     Move move;
     move.id = candidate.id;
@@ -533,26 +625,45 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
     moves.push_back(std::move(move));
   }
 
-  apply_moves(moves);
+  *reassigned_vectors = apply_moves(moves);
   std::vector<faiss::idx_t> targets;
   targets.reserve(moves.size());
   for (const Move& move : moves) targets.push_back(move.target);
   std::sort(targets.begin(), targets.end());
   targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
-  reassign_moved_ += moves.size();
   return targets;
 }
 
-void IndexIVFFlatLIRE::apply_moves(const std::vector<Move>& moves) {
-  if (moves.empty()) return;
+uint64_t IndexIVFFlatLIRE::apply_moves(const std::vector<Move>& moves) {
+  if (moves.empty()) return 0;
   std::unordered_map<faiss::idx_t, ListData> lists;
   std::unordered_map<faiss::idx_t, faiss::idx_t> target_by_id;
   for (const Move& move : moves) {
-    if (!lists.count(move.source)) lists.emplace(move.source, read_list(move.source));
-    if (!lists.count(move.target)) lists.emplace(move.target, read_list(move.target));
+    if (!lists.count(move.source)) lists.emplace(move.source, ListData{});
+    if (!lists.count(move.target)) lists.emplace(move.target, ListData{});
     target_by_id.emplace(move.id, move.target);
   }
-
+  std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
+  std::vector<faiss::idx_t> slots;
+  slots.reserve(lists.size());
+  for (const auto& entry : lists) slots.push_back(entry.first);
+  std::sort(slots.begin(), slots.end());
+  std::vector<std::unique_lock<std::shared_mutex>> list_locks;
+  list_locks.reserve(slots.size());
+  for (faiss::idx_t slot : slots) list_locks.emplace_back(list_mutex(slot));
+  for (faiss::idx_t slot : slots) lists.at(slot) = read_list(slot);
+  std::lock_guard<std::mutex> membership_lock(membership_mutex_);
+  std::vector<Move> valid_moves;
+  valid_moves.reserve(moves.size());
+  for (const Move& move : moves) {
+    if (move.id >= 0 && static_cast<size_t>(move.id) < membership_.size() &&
+        membership_[static_cast<size_t>(move.id)] == move.source &&
+        active_[static_cast<size_t>(move.target)]) {
+      valid_moves.push_back(move);
+    }
+  }
+  target_by_id.clear();
+  for (const Move& move : valid_moves) target_by_id.emplace(move.id, move.target);
   for (auto& entry : lists) {
     ListData filtered;
     filtered.ids.reserve(entry.second.size());
@@ -571,24 +682,32 @@ void IndexIVFFlatLIRE::apply_moves(const std::vector<Move>& moves) {
     entry.second = std::move(filtered);
   }
 
-  for (const Move& move : moves) {
+  for (const Move& move : valid_moves) {
     ListData& target = lists.at(move.target);
     target.ids.push_back(move.id);
     target.vectors.insert(target.vectors.end(), move.vector.begin(), move.vector.end());
   }
-  for (const auto& entry : lists) write_list(entry.first, entry.second);
-  for (const Move& move : moves) membership_[static_cast<size_t>(move.id)] = move.target;
+  for (const auto& entry : lists) {
+    write_list(entry.first, entry.second);
+    ++list_generation_[static_cast<size_t>(entry.first)];
+  }
+  for (const Move& move : valid_moves)
+    membership_[static_cast<size_t>(move.id)] = move.target;
+  reassign_moved_ += valid_moves.size();
+  return valid_moves.size();
 }
 
-void IndexIVFFlatLIRE::run_maintenance(
+IndexIVFFlatLIRE::MaintenanceResult IndexIVFFlatLIRE::run_maintenance(
     const std::vector<faiss::idx_t>& touched) {
+  MaintenanceResult result;
   std::deque<faiss::idx_t> queue;
   std::vector<uint8_t> queued(max_nlist_, 0);
   for (faiss::idx_t slot : touched) {
     if (slot < 0 || slot >= static_cast<faiss::idx_t>(max_nlist_)) continue;
-    if (!queued[static_cast<size_t>(slot)] &&
-        invlists->list_size(static_cast<size_t>(slot)) >
-            config_.split_threshold) {
+    std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+    std::shared_lock<std::shared_mutex> list_lock(list_mutex(slot));
+    if (!queued[static_cast<size_t>(slot)] && active_[static_cast<size_t>(slot)] &&
+        invlists->list_size(static_cast<size_t>(slot)) > config_.split_threshold) {
       queue.push_back(slot);
       queued[static_cast<size_t>(slot)] = 1;
     }
@@ -599,27 +718,213 @@ void IndexIVFFlatLIRE::run_maintenance(
     const faiss::idx_t slot = queue.front();
     queue.pop_front();
     queued[static_cast<size_t>(slot)] = 0;
-    if (!active_[static_cast<size_t>(slot)] ||
-        invlists->list_size(static_cast<size_t>(slot)) <=
-            config_.split_threshold) {
-      continue;
+    {
+      std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+      if (!active_[static_cast<size_t>(slot)]) continue;
+      std::shared_lock<std::shared_mutex> list_lock(list_mutex(slot));
+      if (invlists->list_size(static_cast<size_t>(slot)) <=
+          config_.split_threshold) continue;
     }
     if (++splits > config_.max_splits_per_batch) {
       throw std::runtime_error("LIRE exceeded max_splits_per_batch");
     }
-    const std::vector<faiss::idx_t> changed = split_one(slot);
+    bool did_split = false;
+    uint64_t moved = 0;
+    const std::vector<faiss::idx_t> changed = split_one(slot, &did_split, &moved);
+    result.split_count += did_split ? 1u : 0u;
+    result.reassigned_vectors += moved;
+    result.affected_lists.insert(result.affected_lists.end(), changed.begin(), changed.end());
     for (faiss::idx_t changed_slot : changed) {
+      std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+      if (!active_[static_cast<size_t>(changed_slot)]) continue;
+      std::shared_lock<std::shared_mutex> list_lock(list_mutex(changed_slot));
       if (!queued[static_cast<size_t>(changed_slot)] &&
-          invlists->list_size(static_cast<size_t>(changed_slot)) >
-              config_.split_threshold) {
+          invlists->list_size(static_cast<size_t>(changed_slot)) > config_.split_threshold) {
         queue.push_back(changed_slot);
         queued[static_cast<size_t>(changed_slot)] = 1;
       }
     }
   }
+  std::sort(result.affected_lists.begin(), result.affected_lists.end());
+  result.affected_lists.erase(
+      std::unique(result.affected_lists.begin(), result.affected_lists.end()),
+      result.affected_lists.end());
+  return result;
+}
+
+void IndexIVFFlatLIRE::enqueue_maintenance(faiss::idx_t slot) {
+  if (slot < 0 || slot >= static_cast<faiss::idx_t>(max_nlist_)) return;
+  std::lock_guard<std::mutex> queue_lock(maintenance_queue_mutex_);
+  if (maintenance_stopping_) return;
+  {
+    std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+    std::shared_lock<std::shared_mutex> list_lock(list_mutex(slot));
+    if (!active_[static_cast<size_t>(slot)] ||
+        invlists->list_size(static_cast<size_t>(slot)) <= config_.split_threshold) {
+      return;
+    }
+  }
+  if (maintenance_queued_or_running_[static_cast<size_t>(slot)]) return;
+  maintenance_queued_or_running_[static_cast<size_t>(slot)] = 1;
+  maintenance_request_ms_[static_cast<size_t>(slot)] =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - maintenance_epoch_).count();
+  maintenance_queue_.push_back(slot);
+  maintenance_queue_cv_.notify_one();
+}
+
+void IndexIVFFlatLIRE::maintenance_worker() {
+  for (;;) {
+    faiss::idx_t slot = -1;
+    {
+      std::unique_lock<std::mutex> lock(maintenance_queue_mutex_);
+      maintenance_queue_cv_.wait(lock, [&] {
+        return maintenance_stopping_ || !maintenance_queue_.empty();
+      });
+      if (maintenance_stopping_ && maintenance_queue_.empty()) return;
+      slot = maintenance_queue_.front();
+      maintenance_queue_.pop_front();
+      ++maintenance_active_workers_;
+    }
+
+    LireMaintenanceEvent event;
+    event.triggering_list = slot;
+    bool completed = false;
+    uint64_t generation_before_job = 0;
+    {
+      std::lock_guard<std::mutex> lock(maintenance_queue_mutex_);
+      event.request_ms = maintenance_request_ms_[static_cast<size_t>(slot)];
+    }
+    try {
+      {
+        std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+        std::shared_lock<std::shared_mutex> list_lock(list_mutex(slot));
+        generation_before_job = list_generation_[static_cast<size_t>(slot)];
+      }
+      event.job_id = maintenance_job_serial_.fetch_add(1, std::memory_order_relaxed) + 1;
+      event.start_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - maintenance_epoch_).count();
+      const MaintenanceResult result = run_maintenance({slot});
+      event.compute_done_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - maintenance_epoch_).count();
+      event.commit_done_ms = event.compute_done_ms;
+      event.end_ms = event.compute_done_ms;
+      event.split_count = result.split_count;
+      event.reassigned_vectors = result.reassigned_vectors;
+      event.affected_lists = static_cast<uint32_t>(result.affected_lists.size());
+      event.affected_list_ids = result.affected_lists;
+      {
+        std::lock_guard<std::mutex> event_lock(maintenance_events_mutex_);
+        maintenance_events_.push_back(event);
+      }
+      completed = true;
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(maintenance_queue_mutex_);
+      if (!maintenance_error_) maintenance_error_ = std::current_exception();
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(maintenance_queue_mutex_);
+      maintenance_queued_or_running_[static_cast<size_t>(slot)] = 0;
+    }
+    if (completed) {
+      bool changed_during_completion = false;
+      {
+        std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+        std::shared_lock<std::shared_mutex> list_lock(list_mutex(slot));
+        changed_during_completion =
+            list_generation_[static_cast<size_t>(slot)] != generation_before_job;
+      }
+      if (changed_during_completion) enqueue_maintenance(slot);
+    }
+    {
+      std::lock_guard<std::mutex> lock(maintenance_queue_mutex_);
+      --maintenance_active_workers_;
+      if (maintenance_queue_.empty() && maintenance_active_workers_ == 0)
+        maintenance_idle_cv_.notify_all();
+    }
+  }
+}
+
+void IndexIVFFlatLIRE::start_maintenance_workers() {
+  std::lock_guard<std::mutex> lock(maintenance_queue_mutex_);
+  if (maintenance_started_) return;
+  maintenance_stopping_ = false;
+  maintenance_started_ = true;
+  const uint32_t count = std::max<uint32_t>(1, config_.maintenance_threads);
+  maintenance_workers_.reserve(count);
+  for (uint32_t i = 0; i < count; ++i)
+    maintenance_workers_.emplace_back(&IndexIVFFlatLIRE::maintenance_worker, this);
+  maintenance_queue_cv_.notify_all();
+}
+
+void IndexIVFFlatLIRE::wait_for_maintenance() {
+  bool needs_workers = false;
+  {
+    std::lock_guard<std::mutex> lock(maintenance_queue_mutex_);
+    needs_workers = !maintenance_queue_.empty() && !maintenance_started_;
+  }
+  if (needs_workers) start_maintenance_workers();
+  std::unique_lock<std::mutex> lock(maintenance_queue_mutex_);
+  maintenance_idle_cv_.wait(lock, [&] {
+    return maintenance_queue_.empty() && maintenance_active_workers_ == 0;
+  });
+  const std::exception_ptr error = maintenance_error_;
+  lock.unlock();
+  if (error) std::rethrow_exception(error);
+}
+
+void IndexIVFFlatLIRE::stop_maintenance_workers() {
+  std::exception_ptr pending_error;
+  try {
+    wait_for_maintenance();
+  } catch (...) {
+    pending_error = std::current_exception();
+  }
+  {
+    std::lock_guard<std::mutex> lock(maintenance_queue_mutex_);
+    if (!maintenance_started_) {
+      if (pending_error) std::rethrow_exception(pending_error);
+      return;
+    }
+  }
+  {
+    std::unique_lock<std::mutex> lock(maintenance_queue_mutex_);
+    maintenance_idle_cv_.wait(lock, [&] {
+      return maintenance_queue_.empty() && maintenance_active_workers_ == 0;
+    });
+    if (!pending_error) pending_error = maintenance_error_;
+    maintenance_stopping_ = true;
+  }
+  maintenance_queue_cv_.notify_all();
+  for (std::thread& worker : maintenance_workers_) {
+    if (worker.joinable()) worker.join();
+  }
+  maintenance_workers_.clear();
+  std::lock_guard<std::mutex> lock(maintenance_queue_mutex_);
+  maintenance_started_ = false;
+  if (pending_error) std::rethrow_exception(pending_error);
+}
+
+faiss::idx_t IndexIVFFlatLIRE::published_rows() const {
+  return published_rows_.load(std::memory_order_acquire);
+}
+
+std::vector<LireMaintenanceEvent> IndexIVFFlatLIRE::maintenance_events() const {
+  std::lock_guard<std::mutex> lock(maintenance_events_mutex_);
+  return maintenance_events_;
+}
+
+void IndexIVFFlatLIRE::reset_maintenance_timeline() {
+  wait_for_maintenance();
+  maintenance_epoch_ = std::chrono::steady_clock::now();
+  maintenance_job_serial_.store(0, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(maintenance_events_mutex_);
+  maintenance_events_.clear();
 }
 
 void IndexIVFFlatLIRE::train(faiss::idx_t n, const float* x) {
+  std::lock_guard<std::mutex> insert_lock(insert_mutex_);
   std::unique_lock<std::shared_mutex> lock(state_mutex_);
   if (n <= 0 || x == nullptr) throw std::runtime_error("empty LIRE training set");
   if (ntotal != 0) throw std::runtime_error("cannot retrain non-empty LIRE index");
@@ -640,6 +945,9 @@ void IndexIVFFlatLIRE::train(faiss::idx_t n, const float* x) {
     free_slots_.push_back(static_cast<faiss::idx_t>(slot - 1));
   }
   active_nlist_ = initial_nlist_;
+  std::fill(list_generation_.begin(), list_generation_.end(), 0);
+  published_rows_.store(0, std::memory_order_release);
+  maintenance_epoch_ = std::chrono::steady_clock::now();
   rebuild_quantizer();
   is_trained = true;
 }
@@ -648,11 +956,12 @@ void IndexIVFFlatLIRE::add_with_ids(
     faiss::idx_t n,
     const float* x,
     const faiss::idx_t* xids) {
-  std::unique_lock<std::shared_mutex> lock(state_mutex_);
+  std::lock_guard<std::mutex> insert_lock(insert_mutex_);
   if (!is_trained) throw std::runtime_error("LIRE index is not trained");
   if (n < 0 || (n > 0 && x == nullptr)) throw std::runtime_error("invalid LIRE add");
   if (n == 0) return;
 
+  std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
   std::vector<faiss::idx_t> ids(static_cast<size_t>(n));
   for (faiss::idx_t i = 0; i < n; ++i) {
     ids[static_cast<size_t>(i)] = xids ? xids[i] : ntotal + i;
@@ -664,8 +973,14 @@ void IndexIVFFlatLIRE::add_with_ids(
 
   std::vector<float> coarse_distances(static_cast<size_t>(n));
   std::vector<faiss::idx_t> assignments(static_cast<size_t>(n));
-  active_quantizer()->search(
-      n, x, 1, coarse_distances.data(), assignments.data());
+#ifdef _OPENMP
+  const int previous_omp_threads = omp_get_max_threads();
+  omp_set_num_threads(static_cast<int>(std::max<uint32_t>(1, config_.insert_threads)));
+#endif
+  active_quantizer()->search(n, x, 1, coarse_distances.data(), assignments.data());
+#ifdef _OPENMP
+  omp_set_num_threads(previous_omp_threads);
+#endif
 
   std::vector<std::vector<size_t>> positions(max_nlist_);
   std::vector<faiss::idx_t> touched;
@@ -679,7 +994,16 @@ void IndexIVFFlatLIRE::add_with_ids(
     positions[static_cast<size_t>(slot)].push_back(static_cast<size_t>(i));
   }
 
-  membership_.resize(static_cast<size_t>(ntotal + n), -1);
+  std::vector<std::unique_lock<std::shared_mutex>> list_locks;
+  std::sort(touched.begin(), touched.end());
+  list_locks.reserve(touched.size());
+  for (faiss::idx_t slot : touched) list_locks.emplace_back(list_mutex(slot));
+  const faiss::idx_t begin_id = published_rows_.load(std::memory_order_relaxed);
+  if (begin_id != ntotal) throw std::runtime_error("LIRE published row count mismatch");
+  {
+    std::lock_guard<std::mutex> membership_lock(membership_mutex_);
+    membership_.resize(static_cast<size_t>(begin_id + n), -1);
+  }
   for (faiss::idx_t slot : touched) {
     const auto& pos = positions[static_cast<size_t>(slot)];
     std::vector<faiss::idx_t> list_ids(pos.size());
@@ -691,22 +1015,39 @@ void IndexIVFFlatLIRE::add_with_ids(
       std::copy(x + input_index * static_cast<size_t>(d),
                 x + (input_index + 1) * static_cast<size_t>(d),
                 list_vectors.data() + j * static_cast<size_t>(d));
-      membership_[static_cast<size_t>(id)] = slot;
     }
     invlists->add_entries(
         static_cast<size_t>(slot),
         list_ids.size(),
         list_ids.data(),
         reinterpret_cast<const uint8_t*>(list_vectors.data()));
+    ++list_generation_[static_cast<size_t>(slot)];
   }
-  ntotal += n;
+  {
+    std::lock_guard<std::mutex> membership_lock(membership_mutex_);
+    for (faiss::idx_t slot : touched) {
+      for (size_t position : positions[static_cast<size_t>(slot)])
+        membership_[static_cast<size_t>(ids[position])] = slot;
+    }
+  }
+  published_rows_.store(begin_id + n, std::memory_order_release);
+  list_locks.clear();
+  state_lock.unlock();
+  {
+    std::unique_lock<std::shared_mutex> metadata_lock(state_mutex_);
+    ntotal = begin_id + n;
+  }
 
-  run_maintenance(touched);
-  rebuild_quantizer();
-  if (config_.validate_invariants) validate_state();
-
-  std::cout << "[LIRE] maintenance complete, active_clusters="
-            << active_nlist_ << '\n';
+  if (config_.async_maintenance) {
+    for (faiss::idx_t slot : touched) enqueue_maintenance(slot);
+  } else {
+    run_maintenance(touched);
+  }
+  if (config_.validate_invariants) {
+    wait_for_maintenance();
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    validate_state();
+  }
 }
 
 void IndexIVFFlatLIRE::search(
@@ -716,19 +1057,103 @@ void IndexIVFFlatLIRE::search(
     float* distances,
     faiss::idx_t* labels,
     const faiss::SearchParameters* params) const {
-  std::shared_lock<std::shared_mutex> lock(state_mutex_);
-  faiss::IndexIVFFlat::search(n, x, k, distances, labels, params);
+  (void)params;
+  search_at_frontier(n, x, k, distances, labels, published_rows());
+}
+
+void IndexIVFFlatLIRE::search_at_frontier(
+    faiss::idx_t n,
+    const float* x,
+    faiss::idx_t k,
+    float* distances,
+    faiss::idx_t* labels,
+    faiss::idx_t visible_rows) const {
+  if (n < 0 || k < 0 || visible_rows < 0 || (n > 0 && x == nullptr))
+    throw std::runtime_error("invalid LIRE search");
+  if (n == 0 || k == 0) return;
+  const float infinity = std::numeric_limits<float>::infinity();
+  std::fill(distances, distances + static_cast<size_t>(n) * k, infinity);
+  std::fill(labels, labels + static_cast<size_t>(n) * k, -1);
+
+  std::vector<std::vector<faiss::idx_t>> routes(static_cast<size_t>(n));
+  std::vector<faiss::idx_t> locked_slots;
+  std::vector<std::shared_lock<std::shared_mutex>> list_locks;
+  std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+  const uint32_t probe_count = std::min<uint32_t>(nprobe, active_nlist_);
+  for (faiss::idx_t qi = 0; qi < n; ++qi) {
+    std::vector<std::pair<float, faiss::idx_t>> ranked;
+    ranked.reserve(active_nlist_);
+    for (uint32_t slot = 0; slot < max_nlist_; ++slot) {
+      if (!active_[slot]) continue;
+      ranked.emplace_back(l2(x + static_cast<size_t>(qi) * d, centroid(slot)),
+                          static_cast<faiss::idx_t>(slot));
+    }
+    const size_t keep = std::min<size_t>(probe_count, ranked.size());
+    std::partial_sort(ranked.begin(), ranked.begin() + keep, ranked.end(),
+                      [](const auto& a, const auto& b) {
+                        return a.first < b.first ||
+                               (a.first == b.first && a.second < b.second);
+                      });
+    for (size_t j = 0; j < keep; ++j) {
+      routes[static_cast<size_t>(qi)].push_back(ranked[j].second);
+      locked_slots.push_back(ranked[j].second);
+    }
+  }
+  std::sort(locked_slots.begin(), locked_slots.end());
+  locked_slots.erase(std::unique(locked_slots.begin(), locked_slots.end()),
+                     locked_slots.end());
+  list_locks.reserve(locked_slots.size());
+  for (faiss::idx_t slot : locked_slots)
+    list_locks.emplace_back(list_mutex(slot));
+  state_lock.unlock();
+
+  for (faiss::idx_t qi = 0; qi < n; ++qi) {
+    std::vector<std::pair<float, faiss::idx_t>> best;
+    const float* query = x + static_cast<size_t>(qi) * d;
+    for (faiss::idx_t slot : routes[static_cast<size_t>(qi)]) {
+      const size_t list_size = invlists->list_size(static_cast<size_t>(slot));
+      if (list_size == 0) continue;
+      const faiss::idx_t* ids = invlists->get_ids(static_cast<size_t>(slot));
+      const uint8_t* codes = invlists->get_codes(static_cast<size_t>(slot));
+      const float* vectors = reinterpret_cast<const float*>(codes);
+      for (size_t offset = 0; offset < list_size; ++offset) {
+        if (ids[offset] < 0 || ids[offset] >= visible_rows) continue;
+        const float distance = l2(query, vectors + offset * static_cast<size_t>(d));
+        best.emplace_back(distance, ids[offset]);
+      }
+      invlists->release_ids(static_cast<size_t>(slot), ids);
+      invlists->release_codes(static_cast<size_t>(slot), codes);
+    }
+    const size_t keep = std::min<size_t>(static_cast<size_t>(k), best.size());
+    std::partial_sort(best.begin(), best.begin() + keep, best.end(),
+                      [](const auto& a, const auto& b) {
+                        return a.first < b.first ||
+                               (a.first == b.first && a.second < b.second);
+                      });
+    for (size_t j = 0; j < keep; ++j) {
+      distances[static_cast<size_t>(qi) * k + j] = best[j].first;
+      labels[static_cast<size_t>(qi) * k + j] = best[j].second;
+    }
+  }
 }
 
 void IndexIVFFlatLIRE::reset() {
+  wait_for_maintenance();
+  std::lock_guard<std::mutex> insert_lock(insert_mutex_);
   std::unique_lock<std::shared_mutex> lock(state_mutex_);
   for (uint32_t slot = 0; slot < max_nlist_; ++slot) {
+    std::unique_lock<std::shared_mutex> list_lock(list_mutex(slot));
     invlists->resize(slot, 0);
+    ++list_generation_[slot];
   }
-  membership_.clear();
+  {
+    std::lock_guard<std::mutex> membership_lock(membership_mutex_);
+    membership_.clear();
+  }
   ntotal = 0;
+  published_rows_.store(0, std::memory_order_release);
   split_count_ = 0;
-  reassign_scanned_ = 0;
+  reassign_scanned_.store(0, std::memory_order_relaxed);
   reassign_moved_ = 0;
 }
 
@@ -737,6 +1162,7 @@ size_t IndexIVFFlatLIRE::remove_ids(const faiss::IDSelector&) {
 }
 
 void IndexIVFFlatLIRE::validate_state() const {
+  std::lock_guard<std::mutex> membership_lock(membership_mutex_);
   if (membership_.size() != static_cast<size_t>(ntotal)) {
     throw std::runtime_error("LIRE membership size mismatch");
   }
@@ -787,8 +1213,7 @@ uint64_t IndexIVFFlatLIRE::split_count() const {
 }
 
 uint64_t IndexIVFFlatLIRE::reassign_scanned() const {
-  std::shared_lock<std::shared_mutex> lock(state_mutex_);
-  return reassign_scanned_;
+  return reassign_scanned_.load(std::memory_order_relaxed);
 }
 
 uint64_t IndexIVFFlatLIRE::reassign_moved() const {
