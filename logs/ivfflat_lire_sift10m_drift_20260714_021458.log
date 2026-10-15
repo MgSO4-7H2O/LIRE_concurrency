@@ -1,0 +1,250 @@
+[INFO] base=/home/ydy/data/sift10M/drift_fast/sift10m_drifted_base.fvecs n=10000000 d=128
+[INFO] query=/home/ydy/data/sift10M/drift_fast/sift10m_drifted_query.fvecs n=10000
+[INFO] output=/home/ydy/faiss_baseline_lire/result/ivfflat_lire_sift10m_drift_20260714_021458.json
+[CONFIG] algorithm=IndexIVFFlatLIRE, metric=l2, topk=100, nlist=8192, nprobe=64, train_rows=2000000, max_queries=10000, add_threads=36, search_threads=36, gt_threads=36, lire_max_nlist=32768, lire_split_threshold=2560, lire_reassign_k=64, lire_enable_reassign=true, lire_validate_invariants=false
+[BUILD] training IndexIVFFlatLIRE on first 2000000 base vectors
+[BUILD] train_ms=437306
+[INSERT] initial base[0:2000000)
+[LIRE] maintenance complete, active_clusters=8192
+[SNAPSHOT] snapshot_size=2000000 recall=0.843831 recall_new=0.843831 recall_old=0.000000 latency_ms=0.090144 qps=11093.302527 update_ms=42827.780985 throughput=46698.660402
+[INSERT] base[2000000:2100000)
+[LIRE] maintenance complete, active_clusters=8192
+[SNAPSHOT] snapshot_size=2100000 recall=0.843277 recall_new=0.765045 recall_old=0.849256 latency_ms=0.094666 qps=10563.410283 update_ms=2342.036502 throughput=42697.882768
+[INSERT] base[2100000:2200000)
+[LIRE] maintenance complete, active_clusters=8192
+[SNAPSHOT] snapshot_size=2200000 recall=0.823440 recall_new=0.578265 recall_old=0.855929 latency_ms=0.098210 qps=10182.304924 update_ms=2258.627818 throughput=44274.669427
+[INSERT] base[2200000:2300000)
+[LIRE] maintenance complete, active_clusters=8192
+[SNAPSHOT] snapshot_size=2300000 recall=0.823393 recall_new=0.689307 recall_old=0.828937 latency_ms=0.102732 qps=9734.024270 update_ms=2261.251751 throughput=44223.293561
+[INSERT] base[2300000:2400000)
+[LIRE] maintenance complete, active_clusters=8192
+[SNAPSHOT] snapshot_size=2400000 recall=0.824501 recall_new=0.707905 recall_old=0.829878 latency_ms=0.106980 qps=9347.505825 update_ms=2274.152708 throughput=43972.420871
+[INSERT] base[2400000:2500000)
+[LIRE] maintenance complete, active_clusters=8192
+[SNAPSHOT] snapshot_size=2500000 recall=0.825603 recall_new=0.699893 recall_old=0.832712 latency_ms=0.113500 qps=8810.601541 update_ms=2252.587179 throughput=44393.398370
+[INSERT] base[2500000:2600000)
+[LIRE] maintenance complete, active_clusters=8192
+[SNAPSHOT] snapshot_size=2600000 recall=0.824875 recall_new=0.665562 recall_old=0.844526 latency_ms=0.123739 qps=8081.545621 update_ms=2232.468971 throughput=44793.455721
+[INSERT] base[2600000:2700000)
+[LIRE] maintenance complete, active_clusters=8192
+[SNAPSHOT] snapshot_size=2700000 recall=0.824782 recall_new=0.745186 recall_old=0.826717 latency_ms=0.127393 qps=7849.730961 update_ms=2169.215787 throughput=46099.609176
+[INSERT] base[2700000:2800000)
+[LIRE] maintenance complete, active_clusters=8192
+[SNAPSHOT] snapshot_size=2800000 recall=0.825262 recall_new=0.749490 recall_old=0.827128 latency_ms=0.133638 qps=7482.907729 update_ms=2150.937546 throughput=46491.354519
+[INSERT] base[2800000:2900000)
+[LIRE] maintenance complete, active_clusters=8193
+[SNAPSHOT] snapshot_size=2900000 recall=0.826164 recall_new=0.729402 recall_old=0.829040 latency_ms=0.138169 qps=7237.530583 update_ms=4036.647333 throughput=24773.033597
+[INSERT] base[2900000:3000000)
+[LIRE] maintenance complete, active_clusters=8195
+[SNAPSHOT] snapshot_size=3000000 recall=0.826574 recall_new=0.687546 recall_old=0.836240 latency_ms=0.144148 qps=6937.295417 update_ms=4757.758816 throughput=21018.299554
+[INSERT] base[3000000:3100000)
+[LIRE] maintenance complete, active_clusters=8204
+[SNAPSHOT] snapshot_size=3100000 recall=0.844336 recall_new=0.827676 recall_old=0.846726 latency_ms=0.147757 qps=6767.885644 update_ms=15827.365754 throughput=6318.170791
+[INSERT] base[3100000:3200000)
+[LIRE] maintenance complete, active_clusters=8206
+[SNAPSHOT] snapshot_size=3200000 recall=0.844596 recall_new=0.762477 recall_old=0.847585 latency_ms=0.154309 qps=6480.510801 update_ms=7237.327476 throughput=13817.255103
+[INSERT] base[3200000:3300000)
+[LIRE] maintenance complete, active_clusters=8216
+[SNAPSHOT] snapshot_size=3300000 recall=0.843592 recall_new=0.694108 recall_old=0.850335 latency_ms=0.162810 qps=6142.127013 update_ms=30207.651761 throughput=3310.419519
+[INSERT] base[3300000:3400000)
+[LIRE] maintenance complete, active_clusters=8226
+[SNAPSHOT] snapshot_size=3400000 recall=0.840764 recall_new=0.695214 recall_old=0.849456 latency_ms=0.167890 qps=5956.289370 update_ms=29388.993826 throughput=3402.634353
+[INSERT] base[3400000:3500000)
+[LIRE] maintenance complete, active_clusters=8236
+[SNAPSHOT] snapshot_size=3500000 recall=0.842254 recall_new=0.801226 recall_old=0.844284 latency_ms=0.173910 qps=5750.114352 update_ms=23409.301825 throughput=4271.806171
+[INSERT] base[3500000:3600000)
+[LIRE] maintenance complete, active_clusters=8254
+[SNAPSHOT] snapshot_size=3600000 recall=0.841690 recall_new=0.740146 recall_old=0.849956 latency_ms=0.186843 qps=5352.078484 update_ms=44266.038525 throughput=2259.068201
+[INSERT] base[3600000:3700000)
+[LIRE] maintenance complete, active_clusters=8256
+[SNAPSHOT] snapshot_size=3700000 recall=0.837112 recall_new=0.700179 recall_old=0.848213 latency_ms=0.192828 qps=5185.964101 update_ms=5992.526340 throughput=16687.452725
+[INSERT] base[3700000:3800000)
+[LIRE] maintenance complete, active_clusters=8260
+[SNAPSHOT] snapshot_size=3800000 recall=0.838362 recall_new=0.826009 recall_old=0.838873 latency_ms=0.199180 qps=5020.587741 update_ms=7314.669786 throughput=13671.157130
+[INSERT] base[3800000:3900000)
+[LIRE] maintenance complete, active_clusters=8283
+[SNAPSHOT] snapshot_size=3900000 recall=0.839702 recall_new=0.803241 recall_old=0.841706 latency_ms=0.206315 qps=4846.964164 update_ms=74527.635439 throughput=1341.784150
+[INSERT] base[3900000:4000000)
+[LIRE] maintenance complete, active_clusters=8292
+[SNAPSHOT] snapshot_size=4000000 recall=0.837761 recall_new=0.724783 recall_old=0.845909 latency_ms=0.213547 qps=4682.799845 update_ms=18025.098160 throughput=5547.819996
+[INSERT] base[4000000:4100000)
+[LIRE] maintenance complete, active_clusters=8297
+[SNAPSHOT] snapshot_size=4100000 recall=0.838305 recall_new=0.846575 recall_old=0.838136 latency_ms=0.214144 qps=4669.755483 update_ms=15832.927411 throughput=6315.951397
+[INSERT] base[4100000:4200000)
+[LIRE] maintenance complete, active_clusters=8305
+[SNAPSHOT] snapshot_size=4200000 recall=0.839049 recall_new=0.817938 recall_old=0.839615 latency_ms=0.222946 qps=4485.387647 update_ms=21485.941445 throughput=4654.206112
+[INSERT] base[4200000:4300000)
+[LIRE] maintenance complete, active_clusters=8316
+[SNAPSHOT] snapshot_size=4300000 recall=0.834244 recall_new=0.693682 recall_old=0.844733 latency_ms=0.221035 qps=4524.177153 update_ms=28822.970031 throughput=3469.455087
+[INSERT] base[4300000:4400000)
+[LIRE] maintenance complete, active_clusters=8327
+[SNAPSHOT] snapshot_size=4400000 recall=0.836230 recall_new=0.896020 recall_old=0.834152 latency_ms=0.232015 qps=4310.070297 update_ms=27863.463362 throughput=3588.929298
+[INSERT] base[4400000:4500000)
+[LIRE] maintenance complete, active_clusters=8345
+[SNAPSHOT] snapshot_size=4500000 recall=0.836946 recall_new=0.877412 recall_old=0.835427 latency_ms=0.229360 qps=4359.954573 update_ms=33072.711702 throughput=3023.640786
+[INSERT] base[4500000:4600000)
+[LIRE] maintenance complete, active_clusters=8372
+[SNAPSHOT] snapshot_size=4600000 recall=0.836939 recall_new=0.833188 recall_old=0.837110 latency_ms=0.241935 qps=4133.341385 update_ms=47393.583046 throughput=2109.990289
+[INSERT] base[4600000:4700000)
+[LIRE] maintenance complete, active_clusters=8408
+[SNAPSHOT] snapshot_size=4700000 recall=0.834409 recall_new=0.753811 recall_old=0.840518 latency_ms=0.250423 qps=3993.235757 update_ms=66218.976574 throughput=1510.141128
+[INSERT] base[4700000:4800000)
+[LIRE] maintenance complete, active_clusters=8438
+[SNAPSHOT] snapshot_size=4800000 recall=0.828101 recall_new=0.744065 recall_old=0.838053 latency_ms=0.258849 qps=3863.254041 update_ms=80403.836024 throughput=1243.721754
+[INSERT] base[4800000:4900000)
+[LIRE] maintenance complete, active_clusters=8468
+[SNAPSHOT] snapshot_size=4900000 recall=0.829469 recall_new=0.955816 recall_old=0.823701 latency_ms=0.273134 qps=3661.203933 update_ms=77187.892096 throughput=1295.539978
+[INSERT] base[4900000:5000000)
+[LIRE] maintenance complete, active_clusters=8508
+[SNAPSHOT] snapshot_size=5000000 recall=0.829775 recall_new=0.922775 recall_old=0.824703 latency_ms=0.282886 qps=3534.988868 update_ms=95854.457649 throughput=1043.248300
+[INSERT] base[5000000:5100000)
+[LIRE] maintenance complete, active_clusters=8554
+[SNAPSHOT] snapshot_size=5100000 recall=0.832584 recall_new=0.890392 recall_old=0.827441 latency_ms=0.297222 qps=3364.487191 update_ms=161094.710177 throughput=620.752847
+[INSERT] base[5100000:5200000)
+[LIRE] maintenance complete, active_clusters=8597
+[SNAPSHOT] snapshot_size=5200000 recall=0.831876 recall_new=0.806872 recall_old=0.834381 latency_ms=0.300847 qps=3323.951371 update_ms=103995.666164 throughput=961.578532
+[INSERT] base[5200000:5300000)
+[LIRE] maintenance complete, active_clusters=8622
+[SNAPSHOT] snapshot_size=5300000 recall=0.838147 recall_new=0.823415 recall_old=0.839366 latency_ms=0.311388 qps=3211.423427 update_ms=94123.696904 throughput=1062.431707
+[INSERT] base[5300000:5400000)
+[LIRE] maintenance complete, active_clusters=8670
+[SNAPSHOT] snapshot_size=5400000 recall=0.836586 recall_new=0.740292 recall_old=0.845809 latency_ms=0.322123 qps=3104.408564 update_ms=132236.990159 throughput=756.218059
+[INSERT] base[5400000:5500000)
+[LIRE] maintenance complete, active_clusters=8709
+[SNAPSHOT] snapshot_size=5500000 recall=0.834748 recall_new=0.714868 recall_old=0.847839 latency_ms=0.328976 qps=3039.733049 update_ms=78744.658830 throughput=1269.927402
+[INSERT] base[5500000:5600000)
+[LIRE] maintenance complete, active_clusters=8738
+[SNAPSHOT] snapshot_size=5600000 recall=0.836747 recall_new=0.858255 recall_old=0.835567 latency_ms=0.341603 qps=2927.378378 update_ms=75770.393144 throughput=1319.776708
+[INSERT] base[5600000:5700000)
+[LIRE] maintenance complete, active_clusters=8773
+[SNAPSHOT] snapshot_size=5700000 recall=0.835743 recall_new=0.721911 recall_old=0.845334 latency_ms=0.346645 qps=2884.796154 update_ms=73798.550348 throughput=1355.040167
+[INSERT] base[5700000:5800000)
+[LIRE] maintenance complete, active_clusters=8795
+[SNAPSHOT] snapshot_size=5800000 recall=0.840299 recall_new=0.719763 recall_old=0.854406 latency_ms=0.356029 qps=2808.761226 update_ms=53863.260874 throughput=1856.553027
+[INSERT] base[5800000:5900000)
+[LIRE] maintenance complete, active_clusters=8821
+[SNAPSHOT] snapshot_size=5900000 recall=0.840995 recall_new=0.725812 recall_old=0.850887 latency_ms=0.358441 qps=2789.856422 update_ms=64454.215453 throughput=1551.488903
+[INSERT] base[5900000:6000000)
+[LIRE] maintenance complete, active_clusters=8872
+[SNAPSHOT] snapshot_size=6000000 recall=0.849604 recall_new=0.796382 recall_old=0.854613 latency_ms=0.347834 qps=2874.937393 update_ms=106731.339091 throughput=936.931934
+[INSERT] base[6000000:6100000)
+[LIRE] maintenance complete, active_clusters=8907
+[SNAPSHOT] snapshot_size=6100000 recall=0.851021 recall_new=0.830016 recall_old=0.851816 latency_ms=0.361249 qps=2768.177074 update_ms=93792.523902 throughput=1066.183059
+[INSERT] base[6100000:6200000)
+[LIRE] maintenance complete, active_clusters=8955
+[SNAPSHOT] snapshot_size=6200000 recall=0.851712 recall_new=0.791549 recall_old=0.854828 latency_ms=0.364692 qps=2742.042315 update_ms=108251.961281 throughput=923.770792
+[INSERT] base[6200000:6300000)
+[LIRE] maintenance complete, active_clusters=8985
+[SNAPSHOT] snapshot_size=6300000 recall=0.853685 recall_new=0.822090 recall_old=0.855288 latency_ms=0.363001 qps=2754.816642 update_ms=54488.984151 throughput=1835.233333
+[INSERT] base[6300000:6400000)
+[LIRE] maintenance complete, active_clusters=9029
+[SNAPSHOT] snapshot_size=6400000 recall=0.855212 recall_new=0.857105 recall_old=0.855145 latency_ms=0.368129 qps=2716.435693 update_ms=91984.087656 throughput=1087.144555
+[INSERT] base[6400000:6500000)
+[LIRE] maintenance complete, active_clusters=9098
+[SNAPSHOT] snapshot_size=6500000 recall=0.859349 recall_new=0.838737 recall_old=0.860551 latency_ms=0.367308 qps=2722.508368 update_ms=136423.242255 throughput=733.012926
+[INSERT] base[6500000:6600000)
+[LIRE] maintenance complete, active_clusters=9150
+[SNAPSHOT] snapshot_size=6600000 recall=0.863907 recall_new=0.880756 recall_old=0.862809 latency_ms=0.368330 qps=2714.957773 update_ms=118609.141259 throughput=843.105337
+[INSERT] base[6600000:6700000)
+[LIRE] maintenance complete, active_clusters=9201
+[SNAPSHOT] snapshot_size=6700000 recall=0.864844 recall_new=0.819828 recall_old=0.867440 latency_ms=0.370411 qps=2699.704939 update_ms=144746.653470 throughput=690.862259
+[INSERT] base[6700000:6800000)
+[LIRE] maintenance complete, active_clusters=9271
+[SNAPSHOT] snapshot_size=6800000 recall=0.870036 recall_new=0.906668 recall_old=0.867537 latency_ms=0.378882 qps=2639.344397 update_ms=180265.831687 throughput=554.736297
+[INSERT] base[6800000:6900000)
+[LIRE] maintenance complete, active_clusters=9307
+[SNAPSHOT] snapshot_size=6900000 recall=0.871844 recall_new=0.813082 recall_old=0.873970 latency_ms=0.385713 qps=2592.601122 update_ms=85626.325511 throughput=1167.865133
+[INSERT] base[6900000:7000000)
+[LIRE] maintenance complete, active_clusters=9358
+[SNAPSHOT] snapshot_size=7000000 recall=0.874588 recall_new=0.839983 recall_old=0.875924 latency_ms=0.386410 qps=2587.924895 update_ms=126135.731802 throughput=792.796764
+[INSERT] base[7000000:7100000)
+[LIRE] maintenance complete, active_clusters=9421
+[SNAPSHOT] snapshot_size=7100000 recall=0.876538 recall_new=0.884445 recall_old=0.876216 latency_ms=0.396256 qps=2523.623320 update_ms=141413.935970 throughput=707.143884
+[INSERT] base[7100000:7200000)
+[LIRE] maintenance complete, active_clusters=9470
+[SNAPSHOT] snapshot_size=7200000 recall=0.877992 recall_new=0.872101 recall_old=0.878187 latency_ms=0.394047 qps=2537.770073 update_ms=106295.940989 throughput=940.769695
+[INSERT] base[7200000:7300000)
+[LIRE] maintenance complete, active_clusters=9522
+[SNAPSHOT] snapshot_size=7300000 recall=0.878907 recall_new=0.826926 recall_old=0.880450 latency_ms=0.393815 qps=2539.266342 update_ms=123224.948951 throughput=811.523972
+[INSERT] base[7300000:7400000)
+[LIRE] maintenance complete, active_clusters=9564
+[SNAPSHOT] snapshot_size=7400000 recall=0.879290 recall_new=0.821987 recall_old=0.881091 latency_ms=0.399488 qps=2503.206284 update_ms=75482.570729 throughput=1324.809145
+[INSERT] base[7400000:7500000)
+[LIRE] maintenance complete, active_clusters=9611
+[SNAPSHOT] snapshot_size=7500000 recall=0.880309 recall_new=0.815023 recall_old=0.882146 latency_ms=0.405176 qps=2468.060796 update_ms=75615.342823 throughput=1322.482928
+[INSERT] base[7500000:7600000)
+[LIRE] maintenance complete, active_clusters=9665
+[SNAPSHOT] snapshot_size=7600000 recall=0.881625 recall_new=0.869922 recall_old=0.882025 latency_ms=0.401506 qps=2490.622770 update_ms=129519.739948 throughput=772.083082
+[INSERT] base[7600000:7700000)
+[LIRE] maintenance complete, active_clusters=9713
+[SNAPSHOT] snapshot_size=7700000 recall=0.881850 recall_new=0.847026 recall_old=0.882510 latency_ms=0.405535 qps=2465.875472 update_ms=65218.146792 throughput=1533.315571
+[INSERT] base[7700000:7800000)
+[LIRE] maintenance complete, active_clusters=9780
+[SNAPSHOT] snapshot_size=7800000 recall=0.881723 recall_new=0.871284 recall_old=0.881979 latency_ms=0.409518 qps=2441.893884 update_ms=131554.888908 throughput=760.138987
+[INSERT] base[7800000:7900000)
+[LIRE] maintenance complete, active_clusters=9835
+[SNAPSHOT] snapshot_size=7900000 recall=0.882273 recall_new=0.920995 recall_old=0.880860 latency_ms=0.398490 qps=2509.475602 update_ms=153412.384645 throughput=651.837857
+[INSERT] base[7900000:8000000)
+[LIRE] maintenance complete, active_clusters=9890
+[SNAPSHOT] snapshot_size=8000000 recall=0.882821 recall_new=0.930886 recall_old=0.880939 latency_ms=0.412941 qps=2421.652551 update_ms=133215.316128 throughput=750.664435
+[INSERT] base[8000000:8100000)
+[LIRE] maintenance complete, active_clusters=9937
+[SNAPSHOT] snapshot_size=8100000 recall=0.884166 recall_new=0.948271 recall_old=0.881780 latency_ms=0.402679 qps=2483.364594 update_ms=139554.291361 throughput=716.567001
+[INSERT] base[8100000:8200000)
+[LIRE] maintenance complete, active_clusters=9976
+[SNAPSHOT] snapshot_size=8200000 recall=0.884294 recall_new=0.804829 recall_old=0.886174 latency_ms=0.402984 qps=2481.487516 update_ms=66307.717731 throughput=1508.120071
+[INSERT] base[8200000:8300000)
+[LIRE] maintenance complete, active_clusters=10028
+[SNAPSHOT] snapshot_size=8300000 recall=0.886684 recall_new=0.917908 recall_old=0.885527 latency_ms=0.422043 qps=2369.424997 update_ms=129609.027263 throughput=771.551196
+[INSERT] base[8300000:8400000)
+[LIRE] maintenance complete, active_clusters=10086
+[SNAPSHOT] snapshot_size=8400000 recall=0.887469 recall_new=0.901582 recall_old=0.887160 latency_ms=0.419397 qps=2384.376144 update_ms=104676.720783 throughput=955.322246
+[INSERT] base[8400000:8500000)
+[LIRE] maintenance complete, active_clusters=10152
+[SNAPSHOT] snapshot_size=8500000 recall=0.887590 recall_new=0.918543 recall_old=0.886890 latency_ms=0.419502 qps=2383.780142 update_ms=146748.238465 throughput=681.439185
+[INSERT] base[8500000:8600000)
+[LIRE] maintenance complete, active_clusters=10197
+[SNAPSHOT] snapshot_size=8600000 recall=0.887516 recall_new=0.887670 recall_old=0.887513 latency_ms=0.419334 qps=2384.736316 update_ms=64704.506734 throughput=1545.487402
+[INSERT] base[8600000:8700000)
+[LIRE] maintenance complete, active_clusters=10253
+[SNAPSHOT] snapshot_size=8700000 recall=0.887516 recall_new=0.873693 recall_old=0.887724 latency_ms=0.418080 qps=2391.889182 update_ms=94881.618848 throughput=1053.944918
+[INSERT] base[8700000:8800000)
+[LIRE] maintenance complete, active_clusters=10306
+[SNAPSHOT] snapshot_size=8800000 recall=0.886850 recall_new=0.852233 recall_old=0.887424 latency_ms=0.415682 qps=2405.686877 update_ms=81302.772039 throughput=1229.970363
+[INSERT] base[8800000:8900000)
+[LIRE] maintenance complete, active_clusters=10355
+[SNAPSHOT] snapshot_size=8900000 recall=0.886722 recall_new=0.853265 recall_old=0.887290 latency_ms=0.418596 qps=2388.940366 update_ms=80121.146228 throughput=1248.109952
+[INSERT] base[8900000:9000000)
+[LIRE] maintenance complete, active_clusters=10422
+[SNAPSHOT] snapshot_size=9000000 recall=0.886474 recall_new=0.898533 recall_old=0.886218 latency_ms=0.426738 qps=2343.359613 update_ms=133498.258706 throughput=749.073441
+[INSERT] base[9000000:9100000)
+[LIRE] maintenance complete, active_clusters=10478
+[SNAPSHOT] snapshot_size=9100000 recall=0.886140 recall_new=0.881426 recall_old=0.886244 latency_ms=0.411973 qps=2427.343938 update_ms=87495.583058 throughput=1142.914836
+[INSERT] base[9100000:9200000)
+[LIRE] maintenance complete, active_clusters=10534
+[SNAPSHOT] snapshot_size=9200000 recall=0.885956 recall_new=0.843422 recall_old=0.886640 latency_ms=0.415179 qps=2408.601742 update_ms=73197.038506 throughput=1366.175491
+[INSERT] base[9200000:9300000)
+[LIRE] maintenance complete, active_clusters=10596
+[SNAPSHOT] snapshot_size=9300000 recall=0.885600 recall_new=0.894872 recall_old=0.885404 latency_ms=0.427572 qps=2338.785882 update_ms=116652.679645 throughput=857.245631
+[INSERT] base[9300000:9400000)
+[LIRE] maintenance complete, active_clusters=10656
+[SNAPSHOT] snapshot_size=9400000 recall=0.886016 recall_new=0.884434 recall_old=0.886050 latency_ms=0.449446 qps=2224.961162 update_ms=103610.162263 throughput=965.156292
+[INSERT] base[9400000:9500000)
+[LIRE] maintenance complete, active_clusters=10710
+[SNAPSHOT] snapshot_size=9500000 recall=0.886368 recall_new=0.874706 recall_old=0.886570 latency_ms=0.441552 qps=2264.740045 update_ms=86039.593165 throughput=1162.255612
+[INSERT] base[9500000:9600000)
+[LIRE] maintenance complete, active_clusters=10779
+[SNAPSHOT] snapshot_size=9600000 recall=0.886254 recall_new=0.905446 recall_old=0.885884 latency_ms=0.421840 qps=2370.567822 update_ms=115199.245356 throughput=868.061242
+[INSERT] base[9600000:9700000)
+[LIRE] maintenance complete, active_clusters=10849
+[SNAPSHOT] snapshot_size=9700000 recall=0.886144 recall_new=0.944788 recall_old=0.884973 latency_ms=0.424452 qps=2355.980149 update_ms=236510.157315 throughput=422.814822
+[INSERT] base[9700000:9800000)
+[LIRE] maintenance complete, active_clusters=10918
+[SNAPSHOT] snapshot_size=9800000 recall=0.886002 recall_new=0.945570 recall_old=0.884796 latency_ms=0.420924 qps=2375.724145 update_ms=129984.114809 throughput=769.324776
+[INSERT] base[9800000:9900000)
+[LIRE] maintenance complete, active_clusters=10991
+[SNAPSHOT] snapshot_size=9900000 recall=0.885487 recall_new=0.952548 recall_old=0.884264 latency_ms=0.424485 qps=2355.794647 update_ms=151599.834714 throughput=659.631326
+[INSERT] base[9900000:10000000)
+[LIRE] maintenance complete, active_clusters=11045
+[SNAPSHOT] snapshot_size=10000000 recall=0.885449 recall_new=0.961456 recall_old=0.884412 latency_ms=0.424431 qps=2356.096302 update_ms=158374.080259 throughput=631.416453
+[DONE] wrote JSON to /home/ydy/faiss_baseline_lire/result/ivfflat_lire_sift10m_drift_20260714_021458.json
