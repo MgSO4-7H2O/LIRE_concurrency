@@ -251,6 +251,7 @@ IndexIVFFlatLIRE::IndexIVFFlatLIRE(int d, const LireConfig& config)
       initial_nlist_(config.initial_nlist),
       max_nlist_(config.max_nlist),
       centroids_(static_cast<size_t>(config.max_nlist) * d, 0.0f),
+      centroid_generation_(config.max_nlist, 0),
       active_(config.max_nlist, 0),
       list_generation_(config.max_nlist, 0),
       maintenance_queued_or_running_(config.max_nlist, 0),
@@ -563,7 +564,6 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
   ListData input;
   std::vector<float> old_center;
   uint64_t source_generation = 0;
-  uint64_t topology_generation = 0;
   {
     std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
     if (!active_[static_cast<size_t>(slot)]) return {};
@@ -572,7 +572,6 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
         config_.split_threshold) return {};
     input = read_list(slot);
     source_generation = list_generation_[static_cast<size_t>(slot)];
-    topology_generation = topology_generation_;
     old_center.assign(centroid(slot), centroid(slot) + d);
   }
 
@@ -595,12 +594,12 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
 
   faiss::idx_t new_slot = -1;
   {
-    // Follow SPFresh's per-posting synchronization model. The topology lock is
-    // held only for the short list/centroid publication, never for clustering.
+    // The state lock serializes slot allocation and publication. The source
+    // generation is the compute dependency; unrelated list publication does
+    // not invalidate this split.
     std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
     if (!active_[static_cast<size_t>(slot)] ||
-        list_generation_[static_cast<size_t>(slot)] != source_generation ||
-        topology_generation_ != topology_generation) {
+        list_generation_[static_cast<size_t>(slot)] != source_generation) {
       *stale = true;
       ++*stale_retries;
       return {slot};
@@ -616,8 +615,8 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
     for (faiss::idx_t list : lock_slots) {
       list_locks.emplace_back(list_mutex(list));
     }
-    if (list_generation_[static_cast<size_t>(slot)] != source_generation ||
-        topology_generation_ != topology_generation) {
+    if (!active_[static_cast<size_t>(slot)] ||
+        list_generation_[static_cast<size_t>(slot)] != source_generation) {
       *stale = true;
       ++*stale_retries;
       return {slot};
@@ -638,8 +637,13 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
     }
     ++list_generation_[static_cast<size_t>(slot)];
     ++list_generation_[static_cast<size_t>(new_slot)];
+    ++centroid_generation_[static_cast<size_t>(slot)];
+    ++centroid_generation_[static_cast<size_t>(new_slot)];
+    note_oversized_list_state(
+        slot, true, invlists->list_size(static_cast<size_t>(slot)));
+    note_oversized_list_state(
+        new_slot, true, invlists->list_size(static_cast<size_t>(new_slot)));
     ++split_count_;
-    ++topology_generation_;
     rebuild_quantizer();
   }
   *did_split = true;
@@ -670,10 +674,10 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
     std::vector<Candidate> candidate_vectors;
     std::unordered_set<faiss::idx_t> candidate_ids;
     std::vector<float> centroid_snapshot;
+    std::vector<uint64_t> centroid_generations;
     std::vector<uint8_t> active_snapshot;
     std::unordered_map<faiss::idx_t, ListData> list_snapshots;
     std::vector<std::pair<faiss::idx_t, uint64_t>> expected_generations;
-    uint64_t topology_generation = 0;
     std::vector<faiss::idx_t> neighbors;
     {
       std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
@@ -682,8 +686,8 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
         ++*stale_retries;
         return {};
       }
-      topology_generation = topology_generation_;
       centroid_snapshot = centroids_;
+      centroid_generations = centroid_generation_;
       active_snapshot = active_;
       neighbors = nearest_centroid_slots(old_center.data(), old_slot,
                                          config_.reassign_k);
@@ -761,7 +765,7 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
     moves.reserve(candidate_vectors.size());
     for (const Candidate& candidate : candidate_vectors) {
       const faiss::idx_t target = nearest_snapshot(candidate.vector.data());
-      if (target == candidate.source) continue;
+      if (target < 0) continue;
       Move move;
       move.id = candidate.id;
       move.source = candidate.source;
@@ -770,74 +774,188 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::collect_and_reassign(
       moves.push_back(std::move(move));
     }
     if (moves.empty()) return {};
+
+    bool dependencies_stale = false;
+    std::vector<uint64_t> validated_centroid_generations;
+    {
+      // Revalidate the local neighbor set and the lists used by candidate
+      // collection. Target lists are added below after assignment; only their
+      // per-list/centroid generations become commit dependencies.
+      std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+      if (nearest_centroid_slots(old_center.data(), old_slot,
+                                 config_.reassign_k) != neighbors) {
+        dependencies_stale = true;
+      } else {
+        std::vector<faiss::idx_t> dependency_slots;
+        dependency_slots.reserve(expected_generations.size() + moves.size());
+        for (const auto& entry : expected_generations)
+          dependency_slots.push_back(entry.first);
+        for (const Move& move : moves)
+          dependency_slots.push_back(move.target);
+        std::sort(dependency_slots.begin(), dependency_slots.end());
+        dependency_slots.erase(
+            std::unique(dependency_slots.begin(), dependency_slots.end()),
+            dependency_slots.end());
+        std::vector<std::shared_lock<std::shared_mutex>> dependency_locks;
+        dependency_locks.reserve(dependency_slots.size());
+        for (faiss::idx_t list : dependency_slots)
+          dependency_locks.emplace_back(list_mutex(list));
+
+        for (const auto& entry : expected_generations) {
+          if (!active_[static_cast<size_t>(entry.first)] ||
+              list_generation_[static_cast<size_t>(entry.first)] != entry.second) {
+            dependencies_stale = true;
+            break;
+          }
+        }
+        if (!dependencies_stale) {
+          for (const Move& move : moves) {
+            const size_t target = static_cast<size_t>(move.target);
+            if (!active_[target] ||
+                centroid_generation_[target] != centroid_generations[target]) {
+              dependencies_stale = true;
+              break;
+            }
+            const auto found = std::find_if(
+                expected_generations.begin(), expected_generations.end(),
+                [&](const auto& entry) { return entry.first == move.target; });
+            if (found == expected_generations.end()) {
+              expected_generations.emplace_back(
+                  move.target, list_generation_[target]);
+            }
+          }
+        }
+        if (!dependencies_stale && centroid_generation_ != centroid_generations) {
+          for (const Move& move : moves) {
+            if (nearest_active(move.vector.data()) != move.target) {
+              dependencies_stale = true;
+              break;
+            }
+          }
+        }
+        if (!dependencies_stale)
+          validated_centroid_generations = centroid_generation_;
+      }
+    }
+    if (dependencies_stale) {
+      ++*stale_retries;
+      continue;
+    }
+    std::sort(expected_generations.begin(), expected_generations.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
     bool stale = false;
-    *reassigned_vectors += apply_moves(moves, topology_generation,
-                                       expected_generations, &stale);
+    std::vector<faiss::idx_t> changed_lists;
+    *reassigned_vectors += apply_moves(
+        moves, old_slot, old_center, neighbors,
+        validated_centroid_generations,
+        expected_generations, &stale, &changed_lists);
     if (stale) {
       ++*stale_retries;
       continue;
     }
-    std::vector<faiss::idx_t> targets;
-    targets.reserve(moves.size());
-    for (const Move& move : moves) targets.push_back(move.target);
-    std::sort(targets.begin(), targets.end());
-    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
-    return targets;
+    return changed_lists;
   }
 }
 
 uint64_t IndexIVFFlatLIRE::apply_moves(
     const std::vector<Move>& moves,
-    uint64_t topology_generation,
+    faiss::idx_t old_slot,
+    const std::vector<float>& old_center,
+    const std::vector<faiss::idx_t>& expected_neighbors,
+    const std::vector<uint64_t>& validated_centroid_generations,
     const std::vector<std::pair<faiss::idx_t, uint64_t>>& expected_generations,
-    bool* stale) {
+    bool* stale,
+    std::vector<faiss::idx_t>* changed_lists) {
   *stale = false;
+  changed_lists->clear();
   if (moves.empty()) return 0;
-  std::unordered_map<faiss::idx_t, ListData> lists;
-  std::unordered_map<faiss::idx_t, faiss::idx_t> target_by_id;
-  for (const Move& move : moves) {
-    if (!lists.count(move.source)) lists.emplace(move.source, ListData{});
-    if (!lists.count(move.target)) lists.emplace(move.target, ListData{});
-    target_by_id.emplace(move.id, move.target);
-  }
   // Conservative first-version publication: the global state lock protects
   // membership/list consistency while affected lists are materialized and
   // rewritten. This can block query routing during reassignment commit and is
   // a later tuning point.
   std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
-  std::vector<faiss::idx_t> slots;
-  slots.reserve(lists.size());
-  for (const auto& entry : lists) slots.push_back(entry.first);
-  for (const auto& entry : expected_generations) slots.push_back(entry.first);
-  std::sort(slots.begin(), slots.end());
-  slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
-  std::vector<std::unique_lock<std::shared_mutex>> list_locks;
-  list_locks.reserve(slots.size());
-  for (faiss::idx_t slot : slots) list_locks.emplace_back(list_mutex(slot));
-  if (topology_generation_ != topology_generation) {
+  // A topology change is relevant only if it changes the selected neighbor
+  // set or makes a changed centroid beat one of this job's selected targets.
+  if (nearest_centroid_slots(old_center.data(), old_slot, config_.reassign_k) !=
+      expected_neighbors) {
     *stale = true;
     return 0;
   }
+
+  std::vector<Move> current_moves;
+  current_moves.reserve(moves.size());
+  std::vector<faiss::idx_t> lock_slots;
+  lock_slots.reserve(expected_generations.size() + moves.size() * 2);
+  for (const auto& entry : expected_generations)
+    lock_slots.push_back(entry.first);
+  for (const Move& snapshot_move : moves) {
+    Move move = snapshot_move;
+    if (move.source < 0 || move.source >= static_cast<faiss::idx_t>(max_nlist_) ||
+        move.target < 0 || move.target >= static_cast<faiss::idx_t>(max_nlist_) ||
+        !active_[static_cast<size_t>(move.source)] ||
+        !active_[static_cast<size_t>(move.target)]) {
+      *stale = true;
+      return 0;
+    }
+    if (move.target == move.source) continue;
+    lock_slots.push_back(move.source);
+    lock_slots.push_back(move.target);
+    current_moves.push_back(std::move(move));
+  }
+  std::sort(lock_slots.begin(), lock_slots.end());
+  lock_slots.erase(std::unique(lock_slots.begin(), lock_slots.end()),
+                   lock_slots.end());
+  std::vector<std::unique_lock<std::shared_mutex>> list_locks;
+  list_locks.reserve(lock_slots.size());
+  for (faiss::idx_t slot : lock_slots) list_locks.emplace_back(list_mutex(slot));
   for (const auto& entry : expected_generations) {
-    if (list_generation_[static_cast<size_t>(entry.first)] != entry.second) {
+    if (entry.first < 0 || entry.first >= static_cast<faiss::idx_t>(max_nlist_) ||
+        !active_[static_cast<size_t>(entry.first)] ||
+        list_generation_[static_cast<size_t>(entry.first)] != entry.second) {
+      *stale = true;
+      return 0;
+    }
+  }
+  std::vector<faiss::idx_t> centroids_changed_after_validation;
+  for (uint32_t slot = 0; slot < max_nlist_; ++slot) {
+    if (centroid_generation_[slot] != validated_centroid_generations[slot])
+      centroids_changed_after_validation.push_back(
+          static_cast<faiss::idx_t>(slot));
+  }
+  for (const Move& move : moves) {
+    const float target_distance = l2(
+        move.vector.data(), centroid(move.target));
+    for (faiss::idx_t changed_slot : centroids_changed_after_validation) {
+      if (!active_[static_cast<size_t>(changed_slot)]) continue;
+      const float changed_distance = l2(
+          move.vector.data(), centroid(changed_slot));
+      if (changed_distance < target_distance ||
+          (changed_distance == target_distance &&
+           changed_slot < move.target)) {
+        *stale = true;
+        return 0;
+      }
+    }
+  }
+  if (current_moves.empty()) return 0;
+  std::unordered_map<faiss::idx_t, ListData> lists;
+  std::unordered_map<faiss::idx_t, faiss::idx_t> target_by_id;
+  std::lock_guard<std::mutex> membership_lock(membership_mutex_);
+  for (const Move& move : current_moves) {
+    if (move.id < 0 || static_cast<size_t>(move.id) >= membership_.size() ||
+        membership_[static_cast<size_t>(move.id)] != move.source) {
+      *stale = true;
+      return 0;
+    }
+    if (!lists.count(move.source)) lists.emplace(move.source, ListData{});
+    if (!lists.count(move.target)) lists.emplace(move.target, ListData{});
+    if (!target_by_id.emplace(move.id, move.target).second) {
       *stale = true;
       return 0;
     }
   }
   for (auto& entry : lists) entry.second = read_list(entry.first);
-  std::lock_guard<std::mutex> membership_lock(membership_mutex_);
-  std::vector<Move> valid_moves;
-  valid_moves.reserve(moves.size());
-  for (const Move& move : moves) {
-    if (move.id >= 0 && static_cast<size_t>(move.id) < membership_.size() &&
-        membership_[static_cast<size_t>(move.id)] == move.source &&
-        active_[static_cast<size_t>(move.target)]) {
-      valid_moves.push_back(move);
-    }
-  }
-  if (valid_moves.empty()) return 0;
-  target_by_id.clear();
-  for (const Move& move : valid_moves) target_by_id.emplace(move.id, move.target);
   for (auto& entry : lists) {
     ListData filtered;
     filtered.ids.reserve(entry.second.size());
@@ -856,7 +974,7 @@ uint64_t IndexIVFFlatLIRE::apply_moves(
     entry.second = std::move(filtered);
   }
 
-  for (const Move& move : valid_moves) {
+  for (const Move& move : current_moves) {
     ListData& target = lists.at(move.target);
     target.ids.push_back(move.id);
     target.vectors.insert(target.vectors.end(), move.vector.begin(), move.vector.end());
@@ -864,11 +982,19 @@ uint64_t IndexIVFFlatLIRE::apply_moves(
   for (const auto& entry : lists) {
     write_list(entry.first, entry.second);
     ++list_generation_[static_cast<size_t>(entry.first)];
+    note_oversized_list_state(
+        entry.first, active_[static_cast<size_t>(entry.first)],
+        entry.second.size());
+    changed_lists->push_back(entry.first);
   }
-  for (const Move& move : valid_moves)
+  for (const Move& move : current_moves)
     membership_[static_cast<size_t>(move.id)] = move.target;
-  reassign_moved_ += valid_moves.size();
-  return valid_moves.size();
+  reassign_moved_ += current_moves.size();
+  std::sort(changed_lists->begin(), changed_lists->end());
+  changed_lists->erase(
+      std::unique(changed_lists->begin(), changed_lists->end()),
+      changed_lists->end());
+  return current_moves.size();
 }
 
 IndexIVFFlatLIRE::MaintenanceResult IndexIVFFlatLIRE::run_maintenance(
@@ -1172,6 +1298,48 @@ LireMaintenanceStats IndexIVFFlatLIRE::maintenance_stats() const {
   return stats;
 }
 
+LireOversizedListStats IndexIVFFlatLIRE::sample_oversized_active_lists(
+    bool reset_baseline) const {
+  std::vector<uint8_t> current(max_nlist_, 0);
+  LireOversizedListStats stats;
+  std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+  for (uint32_t slot = 0; slot < max_nlist_; ++slot) {
+    if (!active_[slot]) continue;
+    std::shared_lock<std::shared_mutex> list_lock(list_mutex(slot));
+    if (invlists->list_size(slot) > config_.split_threshold) {
+      current[slot] = 1;
+      ++stats.oversized_active_lists;
+    }
+  }
+  std::lock_guard<std::mutex> lock(oversized_stats_mutex_);
+  if (reset_baseline || !oversized_stats_initialized_) {
+    previous_oversized_lists_ = std::move(current);
+    newly_oversized_since_sample_.assign(max_nlist_, 0);
+    oversized_stats_initialized_ = true;
+    return stats;
+  }
+  stats.newly_oversized_lists = std::count(
+      newly_oversized_since_sample_.begin(),
+      newly_oversized_since_sample_.end(), static_cast<uint8_t>(1));
+  previous_oversized_lists_ = std::move(current);
+  std::fill(newly_oversized_since_sample_.begin(),
+            newly_oversized_since_sample_.end(), 0);
+  return stats;
+}
+
+void IndexIVFFlatLIRE::note_oversized_list_state(
+    faiss::idx_t slot, bool active, size_t list_size) {
+  if (slot < 0 || slot >= static_cast<faiss::idx_t>(max_nlist_)) return;
+  std::lock_guard<std::mutex> lock(oversized_stats_mutex_);
+  if (!oversized_stats_initialized_) return;
+  const size_t index = static_cast<size_t>(slot);
+  const uint8_t now_oversized =
+      active && list_size > config_.split_threshold ? 1 : 0;
+  if (!previous_oversized_lists_[index] && now_oversized)
+    newly_oversized_since_sample_[index] = 1;
+  previous_oversized_lists_[index] = now_oversized;
+}
+
 void IndexIVFFlatLIRE::reset_maintenance_timeline() {
   wait_for_maintenance();
   maintenance_epoch_ = std::chrono::steady_clock::now();
@@ -1224,6 +1392,7 @@ void IndexIVFFlatLIRE::train(faiss::idx_t n, const float* x) {
   }
   active_nlist_ = initial_nlist_;
   std::fill(list_generation_.begin(), list_generation_.end(), 0);
+  std::fill(centroid_generation_.begin(), centroid_generation_.end(), 0);
   published_rows_.store(0, std::memory_order_release);
   maintenance_epoch_ = std::chrono::steady_clock::now();
   rebuild_quantizer();
@@ -1302,6 +1471,8 @@ void IndexIVFFlatLIRE::add_with_ids(
         list_ids.data(),
         reinterpret_cast<const uint8_t*>(list_vectors.data()));
     ++list_generation_[static_cast<size_t>(slot)];
+    note_oversized_list_state(
+        slot, true, invlists->list_size(static_cast<size_t>(slot)));
   }
   {
     std::lock_guard<std::mutex> membership_lock(membership_mutex_);
@@ -1455,6 +1626,7 @@ void IndexIVFFlatLIRE::reset() {
     std::unique_lock<std::shared_mutex> list_lock(list_mutex(slot));
     invlists->resize(slot, 0);
     ++list_generation_[slot];
+    note_oversized_list_state(slot, active_[slot], 0);
   }
   {
     std::lock_guard<std::mutex> membership_lock(membership_mutex_);

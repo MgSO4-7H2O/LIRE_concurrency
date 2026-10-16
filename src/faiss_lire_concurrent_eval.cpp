@@ -128,6 +128,8 @@ struct InsertRecord {
   uint64_t maintenance_completed_jobs{0};
   uint64_t maintenance_peak_pending_jobs{0};
   uint64_t maintenance_stale_retries{0};
+  uint64_t oversized_active_lists{0};
+  uint64_t newly_oversized_lists{0};
 };
 
 struct QueryWorkerJoiner {
@@ -203,14 +205,16 @@ void WriteOutputs(const std::string& summary_path,
   const std::string progress_path = (dir / (stem + "_progress.csv")).string();
 
   std::ofstream insert_csv(insert_path);
-  insert_csv << "batch,begin_row,end_row,start_ms,end_ms,insert_latency_ms,insert_throughput_vecps,maintenance_pending_jobs,maintenance_running_jobs,maintenance_completed_jobs,maintenance_peak_pending_jobs,maintenance_stale_retries\n";
+  insert_csv << "batch,begin_row,end_row,start_ms,end_ms,insert_latency_ms,insert_throughput_vecps,maintenance_pending_jobs,maintenance_running_jobs,maintenance_completed_jobs,maintenance_peak_pending_jobs,maintenance_stale_retries,oversized_active_lists,newly_oversized_lists\n";
   for (const auto& record : inserts)
     insert_csv << record.batch << ',' << record.begin_row << ',' << record.end_row << ','
                << record.start_ms << ',' << record.end_ms << ',' << record.latency_ms << ','
                << record.throughput << ',' << record.maintenance_pending_jobs << ','
                << record.maintenance_running_jobs << ',' << record.maintenance_completed_jobs
                << ',' << record.maintenance_peak_pending_jobs << ','
-               << record.maintenance_stale_retries << '\n';
+               << record.maintenance_stale_retries << ','
+               << record.oversized_active_lists << ','
+               << record.newly_oversized_lists << '\n';
 
   std::ofstream event_csv(events_path);
   event_csv << "event_id,type,triggering_list,request_ms,start_ms,compute_done_ms,commit_done_ms,end_ms,queue_wait_ms,execution_ms,stale_retries,affected_lists,affected_list_count,split_count,reassigned_vectors\n";
@@ -324,6 +328,7 @@ void WriteOutputs(const std::string& summary_path,
   const double qps = total_ms > 0.0 ? queries.size() / (total_ms / 1000.0) : 0.0;
   const double realized_insert_arrival_vecps = total_ms > 0.0
       ? (final_rows - initial_rows) * 1000.0 / total_ms : 0.0;
+  const uint64_t final_split_count = index.split_count();
   std::ofstream json(summary_path);
   json << "{\n  \"algorithm\": \"Faiss-based LIRE concurrent\",\n"
        << "  \"config\": \"" << JsonEscape(config_path) << "\",\n"
@@ -374,6 +379,21 @@ void WriteOutputs(const std::string& summary_path,
        << final_maintenance_stats.jobs_completed
        << ",\n  \"maintenance_jobs_retried\": "
        << final_maintenance_stats.jobs_retried
+       << ",\n  \"stale_retries_per_completed_job\": ";
+  if (final_maintenance_stats.jobs_completed > 0) {
+    json << static_cast<double>(final_maintenance_stats.jobs_retried) /
+        final_maintenance_stats.jobs_completed;
+  } else {
+    json << "null";
+  }
+  json << ",\n  \"stale_retries_per_successful_split\": ";
+  if (final_split_count > 0) {
+    json << static_cast<double>(final_maintenance_stats.jobs_retried) /
+        final_split_count;
+  } else {
+    json << "null";
+  }
+  json
        << ",\n  \"maintenance_pending_after_drain\": "
        << final_maintenance_stats.pending_jobs
        << ",\n  \"maintenance_running_after_drain\": "
@@ -389,7 +409,7 @@ void WriteOutputs(const std::string& summary_path,
        << ",\n  \"maintenance_execution_ms\": "
        << final_maintenance_stats.total_execution_ms
        << ",\n  \"active_lists\": "
-       << index.active_nlist() << ",\n  \"split_count\": " << index.split_count()
+       << index.active_nlist() << ",\n  \"split_count\": " << final_split_count
        << ",\n  \"reassign_scanned\": " << index.reassign_scanned()
        << ",\n  \"reassign_moved\": " << index.reassign_moved()
        << ",\n  \"outputs\": {\"timeseries\": \"" << JsonEscape(timeseries_path)
@@ -536,6 +556,7 @@ int main(int argc, char** argv) {
     index.start_maintenance_workers();
     index.wait_for_maintenance();
     if (lire.validate_invariants) index.validate_consistency();
+    index.sample_oversized_active_lists(true);
     index.reset_maintenance_timeline();
     std::cout << "[INITIAL_INSERT] complete published_rows="
               << index.published_rows() << std::endl;
@@ -689,6 +710,10 @@ int main(int argc, char** argv) {
       record.latency_ms = std::chrono::duration<double, std::milli>(insert_end - insert_start).count();
       record.throughput = record.latency_ms > 0.0 ?
           (end - begin) * 1000.0 / record.latency_ms : 0.0;
+      const LireOversizedListStats oversized_stats =
+          index.sample_oversized_active_lists();
+      record.oversized_active_lists = oversized_stats.oversized_active_lists;
+      record.newly_oversized_lists = oversized_stats.newly_oversized_lists;
       insert_records.push_back(record);
       const LireMaintenanceStats batch_maintenance = index.maintenance_stats();
       insert_records.back().maintenance_pending_jobs = batch_maintenance.pending_jobs;
@@ -709,6 +734,8 @@ int main(int argc, char** argv) {
                 << " maintenance_pending=" << batch_maintenance.pending_jobs
                 << " maintenance_peak_pending=" << batch_maintenance.peak_pending_jobs
                 << " maintenance_stale_retries=" << batch_maintenance.jobs_retried
+                << " oversized_active_lists=" << record.oversized_active_lists
+                << " newly_oversized_lists=" << record.newly_oversized_lists
                 << std::endl;
       begin = end;
     }
