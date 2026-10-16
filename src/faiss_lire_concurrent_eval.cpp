@@ -385,6 +385,9 @@ int main(int argc, char** argv) {
       frontiers.push_back(static_cast<uint32_t>(end = std::min<uint64_t>(final_rows, end + cfg.snapshot_interval)));
     const GroundTruth gt = LoadGroundTruth(gt_path, base_path, query_path, query.n,
         cfg.topk, initial_rows, cfg.snapshot_interval, frontiers);
+    std::cout << "[INPUT] base=" << base_path << " rows=" << base.n
+              << " dim=" << base.d << " queries=" << query.n
+              << " topk=" << cfg.topk << " gt=" << gt_path << std::endl;
 
     LireConfig lire;
     lire.initial_nlist = cfg.nlist;
@@ -404,20 +407,31 @@ int main(int argc, char** argv) {
     const uint32_t train_rows = cfg.train_rows ? std::min(cfg.train_rows, initial_rows) : initial_rows;
     if (train_rows < cfg.nlist)
       throw std::runtime_error("train_rows must be at least nlist for IVF training");
+    std::cout << "[TRAIN] start rows=" << train_rows << " nlist=" << cfg.nlist
+              << std::endl;
+    const auto train_start = std::chrono::steady_clock::now();
     index.train(train_rows, RowPtr(base, 0));
+    const double train_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - train_start).count();
+    std::cout << "[TRAIN] complete elapsed_ms=" << train_ms << std::endl;
     std::vector<faiss::idx_t> initial_ids(initial_rows);
     std::iota(initial_ids.begin(), initial_ids.end(), 0);
+    std::cout << "[INITIAL_INSERT] start rows=0.." << initial_rows << std::endl;
     index.add_with_ids(initial_rows, RowPtr(base, 0), initial_ids.data());
     index.start_maintenance_workers();
     index.wait_for_maintenance();
     index.reset_maintenance_timeline();
+    std::cout << "[INITIAL_INSERT] complete published_rows="
+              << index.published_rows() << std::endl;
 
     const uint32_t qthreads = query_threads ? query_threads : 1;
     std::atomic<bool> stop_queries{false};
     std::atomic<uint32_t> next_query{0};
     std::mutex records_mutex;
+    std::mutex progress_mutex;
     std::mutex error_mutex;
     std::exception_ptr query_error;
+    std::atomic<uint64_t> completed_queries{0};
     std::vector<QueryRecord> query_records;
     std::vector<std::thread> workers;
     QueryWorkerJoiner joiner{stop_queries, workers};
@@ -457,6 +471,14 @@ int main(int argc, char** argv) {
             record.recall = cfg.topk ? static_cast<double>(hits) / cfg.topk : 0.0;
             std::lock_guard<std::mutex> lock(records_mutex);
             query_records.push_back(record);
+            const uint64_t completed =
+                completed_queries.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (completed % 50000 == 0) {
+              std::lock_guard<std::mutex> progress_lock(progress_mutex);
+              std::cout << "[QUERY_PROGRESS] completed=" << completed
+                        << " elapsed_ms=" << elapsed_ms()
+                        << " frontier=" << frontier << std::endl;
+            }
           }
         } catch (...) {
           std::lock_guard<std::mutex> lock(error_mutex);
@@ -470,6 +492,15 @@ int main(int argc, char** argv) {
     const uint32_t first_batch_end = final_rows > initial_rows ?
         std::min<uint32_t>(final_rows, initial_rows + cfg.snapshot_interval) : initial_rows;
     uint32_t batch_id = 0;
+    const uint32_t total_batches = static_cast<uint32_t>(
+        (static_cast<uint64_t>(final_rows - initial_rows) + cfg.snapshot_interval - 1) /
+        cfg.snapshot_interval);
+    std::cout << "[STREAM] start initial_rows=" << initial_rows
+              << " final_rows=" << final_rows << " batch_size="
+              << cfg.snapshot_interval << " batches=" << total_batches
+              << " query_workers=" << qthreads << " insert_threads="
+              << lire.insert_threads << " maintenance_threads="
+              << lire.maintenance_threads << std::endl;
     for (uint32_t begin = initial_rows; begin < final_rows;) {
       const uint32_t end = static_cast<uint32_t>(std::min<uint64_t>(final_rows,
           static_cast<uint64_t>(begin) + cfg.snapshot_interval));
@@ -488,8 +519,17 @@ int main(int argc, char** argv) {
       record.throughput = record.latency_ms > 0.0 ?
           (end - begin) * 1000.0 / record.latency_ms : 0.0;
       insert_records.push_back(record);
+      std::cout << "[INSERT_PROGRESS] batch=" << (record.batch + 1) << "/"
+                << total_batches << " rows=[" << begin << "," << end
+                << ") insert_ms=" << record.latency_ms
+                << " insert_vecps=" << record.throughput
+                << " published_rows=" << index.published_rows()
+                << " queries_completed="
+                << completed_queries.load(std::memory_order_relaxed)
+                << std::endl;
       begin = end;
     }
+    std::cout << "[MAINTENANCE] waiting for queued jobs" << std::endl;
     try {
       index.wait_for_maintenance();
     } catch (...) {
@@ -497,6 +537,7 @@ int main(int argc, char** argv) {
       for (auto& worker : workers) if (worker.joinable()) worker.join();
       throw;
     }
+    std::cout << "[MAINTENANCE] all queued jobs complete" << std::endl;
     stop_queries.store(true, std::memory_order_relaxed);
     for (auto& worker : workers) if (worker.joinable()) worker.join();
     const double total_ms = elapsed_ms();
