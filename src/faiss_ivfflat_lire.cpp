@@ -1332,6 +1332,7 @@ void IndexIVFFlatLIRE::add_with_ids(
 #ifdef _OPENMP
       omp_set_num_threads(previous_omp_threads);
 #endif
+    }
 
     std::vector<std::vector<size_t>> positions(max_nlist_);
     std::vector<faiss::idx_t> touched;
