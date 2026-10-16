@@ -14,7 +14,8 @@ Example:
 ```bash
 ./build/faiss_lire_concurrent_eval CONFIG.json DATASET_DIR DISP_GT.gt SUMMARY.json \
   --max-insert-vectors 30000 \
-  --query-threads 8 \
+  --query-workers 8 \
+  --query-threads-per-request 3 \
   --insert-threads 1 \
   --maintenance-threads 3 \
   --update-thread-budget 4 \
@@ -22,10 +23,29 @@ Example:
   --max-maintenance-backlog 6
 ```
 
-Use the same `--query-threads` value and external insert rate cap as DiSPQ.
-`--query-threads N` means N concurrent query workers; each query uses one
-software/Faiss search thread. The query resources do not change when the
-update-side split changes. `--insert-threads N` configures the Faiss/OpenMP
+Align `--query-workers` and `--query-threads-per-request` with the DiSPQ
+configuration, as well as the external insert rate cap. `--query-workers N`
+means N concurrent logical query requests. Each request uses a fixed search
+team of `--query-threads-per-request M` threads, so its Query-side budget is
+N × M. The deprecated `--query-threads N` remains an alias for
+`--query-workers N`; it does not configure per-request parallelism. Query
+resources do not change when the update-side split changes.
+
+Each query team is created before the streaming workload and reused for every
+request handled by its outer query worker. The calling worker is team member
+0 and M−1 persistent helper threads scan the request's selected IVF lists.
+Coarse routing and the visible frontier are selected once per request; all
+team members scan disjoint lists from that route set, and their local top-k
+results are merged into the same top-k ranking as the existing single-thread
+LIRE path. This custom LIRE search path
+does not call Faiss's native IVF search: `search_at_frontier(1, ...)` was a
+serial list scan, so the evaluator parallelizes the already selected list
+scan explicitly. No OpenMP thread-count setting is used in Query. With M=1,
+the current serial scan path is retained. The logged `query_thread_budget` is
+`query_workers × query_threads_per_request`; helper work is not counted as
+additional logical queries.
+
+`--insert-threads N` configures the Faiss/OpenMP
 coarse assignment inside the single foreground insert stream; it does not
 create N frontend insert workers. `--maintenance-threads N` starts N LIRE
 background workers. `--update-thread-budget` checks that
@@ -93,8 +113,8 @@ conditions, and local publication remain LIRE-specific. This evaluator supports
 raw L2 fvecs and insert-only workloads; deletion and plotting are not
 implemented. AVX and formal performance tuning remain deferred.
 
-For small functional checks, use `--max-insert-vectors`, `--query-threads 2`
-or `4`, `--insert-threads 1`, and a maintenance-thread count that fits the
+For small functional checks, use `--max-insert-vectors`, `--query-workers 2`
+or `4`, `--query-threads-per-request 1` or `3`, `--insert-threads 1`, and a maintenance-thread count that fits the
 update budget. Enable `lire_validate_invariants` in a small run to validate
 membership and inverted-list consistency after initial build and final
 maintenance drain. The supplied SIFT1M config's current 4,096-list,

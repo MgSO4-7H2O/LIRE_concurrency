@@ -20,6 +20,134 @@
 
 namespace baseline_eval {
 
+class QuerySearchTeam::Impl {
+ public:
+  explicit Impl(uint32_t count) : thread_count_(count) {
+    if (thread_count_ == 0)
+      throw std::runtime_error("query search team size must be positive");
+    helpers_.reserve(thread_count_ - 1);
+    try {
+      for (uint32_t worker = 1; worker < thread_count_; ++worker)
+        helpers_.emplace_back([this, worker] { helper_loop(worker); });
+    } catch (...) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+        ++generation_;
+      }
+      start_cv_.notify_all();
+      for (std::thread& helper : helpers_)
+        if (helper.joinable()) helper.join();
+      throw;
+    }
+  }
+
+  ~Impl() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+      ++generation_;
+    }
+    start_cv_.notify_all();
+    for (std::thread& helper : helpers_)
+      if (helper.joinable()) helper.join();
+  }
+
+  uint32_t thread_count() const { return thread_count_; }
+
+  void parallel_for(
+      size_t task_count,
+      const std::function<void(uint32_t, size_t)>& task) {
+    if (task_count == 0) return;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (busy_) throw std::runtime_error("query search team used concurrently");
+      busy_ = true;
+      task_ = task;
+      task_count_ = task_count;
+      pending_helpers_ = helpers_.size();
+      task_error_ = nullptr;
+      ++generation_;
+    }
+    start_cv_.notify_all();
+    run_tasks(0);
+    std::exception_ptr error;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      done_cv_.wait(lock, [this] { return pending_helpers_ == 0; });
+      error = task_error_;
+      task_ = {};
+      busy_ = false;
+    }
+    if (error) std::rethrow_exception(error);
+  }
+
+ private:
+  void remember_error(std::exception_ptr error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!task_error_) task_error_ = error;
+  }
+
+  void run_tasks(uint32_t worker) {
+    for (size_t task_index = worker; task_index < task_count_;
+         task_index += thread_count_) {
+      try {
+        task_(worker, task_index);
+      } catch (...) {
+        remember_error(std::current_exception());
+        return;
+      }
+    }
+  }
+
+  void helper_loop(uint32_t worker) {
+    uint64_t observed_generation = 0;
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        start_cv_.wait(lock, [this, observed_generation] {
+          return stopping_ || generation_ != observed_generation;
+        });
+        if (stopping_) return;
+        observed_generation = generation_;
+      }
+      run_tasks(worker);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (--pending_helpers_ == 0) done_cv_.notify_one();
+      }
+    }
+  }
+
+  const uint32_t thread_count_;
+  std::vector<std::thread> helpers_;
+  std::mutex mutex_;
+  std::condition_variable start_cv_;
+  std::condition_variable done_cv_;
+  bool stopping_{false};
+  bool busy_{false};
+  uint64_t generation_{0};
+  size_t pending_helpers_{0};
+  size_t task_count_{0};
+  std::function<void(uint32_t, size_t)> task_;
+  std::exception_ptr task_error_;
+};
+
+QuerySearchTeam::QuerySearchTeam(uint32_t thread_count)
+    : impl_(std::make_unique<Impl>(thread_count)) {}
+
+QuerySearchTeam::~QuerySearchTeam() = default;
+
+uint32_t QuerySearchTeam::thread_count() const {
+  return impl_->thread_count();
+}
+
+void QuerySearchTeam::parallel_for(
+    size_t task_count,
+    const std::function<void(uint32_t, size_t)>& task) {
+  impl_->parallel_for(task_count, task);
+}
+
 class IndexIVFFlatLIRE::ActiveCentroidIndex final : public faiss::Index {
  public:
   ActiveCentroidIndex(int d, uint32_t physical_nlist)
@@ -1219,9 +1347,12 @@ void IndexIVFFlatLIRE::search_at_frontier(
     faiss::idx_t k,
     float* distances,
     faiss::idx_t* labels,
-    faiss::idx_t visible_rows) const {
+    faiss::idx_t visible_rows,
+    QuerySearchTeam* query_team) const {
   if (n < 0 || k < 0 || visible_rows < 0 || (n > 0 && x == nullptr))
     throw std::runtime_error("invalid LIRE search");
+  if (query_team && n != 1)
+    throw std::runtime_error("per-request query team requires exactly one query");
   if (n == 0 || k == 0) return;
   const float infinity = std::numeric_limits<float>::infinity();
   std::fill(distances, distances + static_cast<size_t>(n) * k, infinity);
@@ -1259,29 +1390,56 @@ void IndexIVFFlatLIRE::search_at_frontier(
     list_locks.emplace_back(list_mutex(slot));
   state_lock.unlock();
 
+  const auto candidate_order = [](const auto& a, const auto& b) {
+    return a.first < b.first ||
+           (a.first == b.first && a.second < b.second);
+  };
   for (faiss::idx_t qi = 0; qi < n; ++qi) {
     std::vector<std::pair<float, faiss::idx_t>> best;
     const float* query = x + static_cast<size_t>(qi) * d;
-    for (faiss::idx_t slot : routes[static_cast<size_t>(qi)]) {
+    auto scan_list = [&](std::vector<std::pair<float, faiss::idx_t>>& output,
+                         faiss::idx_t slot) {
       const size_t list_size = invlists->list_size(static_cast<size_t>(slot));
-      if (list_size == 0) continue;
+      if (list_size == 0) return;
       const faiss::idx_t* ids = invlists->get_ids(static_cast<size_t>(slot));
       const uint8_t* codes = invlists->get_codes(static_cast<size_t>(slot));
       const float* vectors = reinterpret_cast<const float*>(codes);
-      for (size_t offset = 0; offset < list_size; ++offset) {
-        if (ids[offset] < 0 || ids[offset] >= visible_rows) continue;
-        const float distance = l2(query, vectors + offset * static_cast<size_t>(d));
-        best.emplace_back(distance, ids[offset]);
+      try {
+        for (size_t offset = 0; offset < list_size; ++offset) {
+          if (ids[offset] < 0 || ids[offset] >= visible_rows) continue;
+          const float distance = l2(query, vectors + offset * static_cast<size_t>(d));
+          output.emplace_back(distance, ids[offset]);
+        }
+      } catch (...) {
+        invlists->release_ids(static_cast<size_t>(slot), ids);
+        invlists->release_codes(static_cast<size_t>(slot), codes);
+        throw;
       }
       invlists->release_ids(static_cast<size_t>(slot), ids);
       invlists->release_codes(static_cast<size_t>(slot), codes);
+    };
+    if (query_team) {
+      std::vector<std::vector<std::pair<float, faiss::idx_t>>> local_best(
+          query_team->thread_count());
+      query_team->parallel_for(routes[static_cast<size_t>(qi)].size(),
+          [&](uint32_t worker, size_t route_index) {
+            scan_list(local_best[worker], routes[static_cast<size_t>(qi)][route_index]);
+          });
+      for (auto& local : local_best) {
+        const size_t local_keep = std::min<size_t>(static_cast<size_t>(k), local.size());
+        if (local.size() > local_keep) {
+          std::partial_sort(local.begin(), local.begin() + local_keep,
+                            local.end(), candidate_order);
+          local.resize(local_keep);
+        }
+        best.insert(best.end(), local.begin(), local.end());
+      }
+    } else {
+      for (faiss::idx_t slot : routes[static_cast<size_t>(qi)])
+        scan_list(best, slot);
     }
     const size_t keep = std::min<size_t>(static_cast<size_t>(k), best.size());
-    std::partial_sort(best.begin(), best.begin() + keep, best.end(),
-                      [](const auto& a, const auto& b) {
-                        return a.first < b.first ||
-                               (a.first == b.first && a.second < b.second);
-                      });
+    std::partial_sort(best.begin(), best.begin() + keep, best.end(), candidate_order);
     for (size_t j = 0; j < keep; ++j) {
       distances[static_cast<size_t>(qi) * k + j] = best[j].first;
       labels[static_cast<size_t>(qi) * k + j] = best[j].second;

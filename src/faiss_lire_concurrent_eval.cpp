@@ -166,6 +166,7 @@ void WriteOutputs(const std::string& summary_path,
                   const std::string& gt_path,
                   uint32_t topk,
                   uint32_t query_workers,
+                  uint32_t query_threads_per_request,
                   uint32_t insert_threads,
                   uint32_t maintenance_threads,
                   uint32_t update_thread_budget,
@@ -331,8 +332,10 @@ void WriteOutputs(const std::string& summary_path,
        << "  \"gt_artifact\": \"" << JsonEscape(gt_path) << "\",\n"
        << "  \"topk\": " << topk << ",\n"
        << "  \"query_workers\": " << query_workers << ",\n"
+       << "  \"query_threads_per_request\": " << query_threads_per_request << ",\n"
+       << "  \"query_thread_budget\": "
+       << static_cast<uint64_t>(query_workers) * query_threads_per_request << ",\n"
        << "  \"insert_threads\": " << insert_threads << ",\n"
-       << "  \"query_threads_per_request\": 1,\n"
        << "  \"frontend_insert_streams\": 1,\n"
        << "  \"maintenance_threads\": " << maintenance_threads << ",\n"
        << "  \"update_thread_budget\": " << update_thread_budget << ",\n"
@@ -406,9 +409,13 @@ int main(int argc, char** argv) {
     uint64_t max_maintenance_backlog = 0;
     uint32_t update_thread_budget = 2;
     double insert_rate_limit = 0.0;
-    uint32_t query_threads = 0, insert_threads = 0, maintenance_threads = 0;
+    uint32_t query_workers_arg = 0, deprecated_query_threads = 0;
+    uint32_t query_threads_per_request = 1;
+    uint32_t insert_threads = 0, maintenance_threads = 0;
     bool cap_seen = false;
     bool update_budget_seen = false;
+    bool query_workers_seen = false;
+    bool deprecated_query_threads_seen = false;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       auto parse_option = [&](uint32_t* out, const std::string& name) {
@@ -433,16 +440,25 @@ int main(int argc, char** argv) {
       } else if (arg == "--update-thread-budget") {
         parse_option(&update_thread_budget, arg);
         update_budget_seen = true;
-      } else if (arg == "--query-threads") parse_option(&query_threads, arg);
-      else if (arg == "--insert-threads") parse_option(&insert_threads, arg);
+      } else if (arg == "--query-workers") {
+        parse_option(&query_workers_arg, arg);
+        query_workers_seen = true;
+      } else if (arg == "--query-threads-per-request") {
+        parse_option(&query_threads_per_request, arg);
+      } else if (arg == "--query-threads") {
+        parse_option(&deprecated_query_threads, arg);
+        deprecated_query_threads_seen = true;
+      } else if (arg == "--insert-threads") parse_option(&insert_threads, arg);
       else if (arg == "--maintenance-threads") parse_option(&maintenance_threads, arg);
       else if (arg.rfind("--", 0) == 0) throw std::runtime_error("Unknown option: " + arg);
       else positional.push_back(arg);
     }
     if (positional.size() < 3 || positional.size() > 4) {
-      std::cerr << "Usage: faiss_lire_concurrent_eval <config.json> <dataset_dir_or_base.fvecs> <disp_gt> [summary.json] [--max-insert-vectors N] [--query-threads N] [--insert-threads N] [--maintenance-threads N] [--update-thread-budget N] [--max-maintenance-backlog N] [--insert-rate-limit VECTORS_PER_SEC]\n";
+      std::cerr << "Usage: faiss_lire_concurrent_eval <config.json> <dataset_dir_or_base.fvecs> <disp_gt> [summary.json] [--max-insert-vectors N] [--query-workers N] [--query-threads-per-request M] [--query-threads N (deprecated alias for --query-workers)] [--insert-threads N] [--maintenance-threads N] [--update-thread-budget N] [--max-maintenance-backlog N] [--insert-rate-limit VECTORS_PER_SEC]\n";
       return 2;
     }
+    if (query_workers_seen && deprecated_query_threads_seen)
+      throw std::runtime_error("use either --query-workers or deprecated --query-threads, not both");
     const std::string config_path = positional[0];
     Config cfg = LoadConfigJson(config_path);
     const std::string base_path = ResolveFileWithSuffix(positional[1], "_base.fvecs");
@@ -524,7 +540,22 @@ int main(int argc, char** argv) {
     std::cout << "[INITIAL_INSERT] complete published_rows="
               << index.published_rows() << std::endl;
 
-    const uint32_t qthreads = query_threads ? query_threads : 1;
+    const uint32_t query_workers = query_workers_seen ? query_workers_arg :
+        (deprecated_query_threads_seen ? deprecated_query_threads : 1);
+    const uint64_t query_thread_budget =
+        static_cast<uint64_t>(query_workers) * query_threads_per_request;
+    std::vector<std::unique_ptr<QuerySearchTeam>> query_teams;
+    query_teams.reserve(query_workers);
+    for (uint32_t worker = 0; worker < query_workers; ++worker)
+      query_teams.emplace_back(
+          std::make_unique<QuerySearchTeam>(query_threads_per_request));
+    std::cout << "[QUERY] fixed_search_teams=" << query_workers
+              << " team_size=" << query_threads_per_request
+              << " nprobe=" << index.nprobe
+              << " persistent_helper_threads="
+              << static_cast<uint64_t>(query_workers) *
+                     (query_threads_per_request - 1)
+              << "\n";
     std::atomic<bool> stop_queries{false};
     std::atomic<bool> start_queries{false};
     std::atomic<uint32_t> next_query{0};
@@ -544,16 +575,16 @@ int main(int argc, char** argv) {
     run_start = std::chrono::steady_clock::now();
     const double streaming_workload_start_ms = elapsed_ms();
     std::cout << "[WORKLOAD] start elapsed_ms=" << streaming_workload_start_ms
-              << " query_workers=" << qthreads
-              << " query_threads_per_request=1"
+              << " query_workers=" << query_workers
+              << " query_threads_per_request=" << query_threads_per_request
+              << " query_thread_budget=" << query_thread_budget
               << " insert_threads=" << lire.insert_threads
               << " maintenance_threads=" << lire.maintenance_threads
               << " update_thread_budget=" << update_thread_budget
               << " max_maintenance_backlog=" << max_maintenance_backlog
               << " insert_rate_limit_vecps=" << insert_rate_limit << std::endl;
-    for (uint32_t worker = 0; worker < qthreads; ++worker) {
+    for (uint32_t worker = 0; worker < query_workers; ++worker) {
       workers.emplace_back([&, worker] {
-        (void)worker;
         try {
           std::vector<float> distances(cfg.topk);
           std::vector<faiss::idx_t> labels(cfg.topk);
@@ -566,7 +597,8 @@ int main(int argc, char** argv) {
             const uint32_t frontier = static_cast<uint32_t>(index.published_rows());
             const auto start = std::chrono::steady_clock::now();
             index.search_at_frontier(1, RowPtr(query, qi), cfg.topk,
-                                     distances.data(), labels.data(), frontier);
+                                     distances.data(), labels.data(), frontier,
+                                     query_teams[worker].get());
             const auto end = std::chrono::steady_clock::now();
             QueryRecord record;
             record.query_id = qi;
@@ -614,7 +646,10 @@ int main(int argc, char** argv) {
     std::cout << "[STREAM] start initial_rows=" << initial_rows
               << " final_rows=" << final_rows << " batch_size="
               << cfg.snapshot_interval << " batches=" << total_batches
-              << " query_workers=" << qthreads << " insert_threads="
+              << " query_workers=" << query_workers
+              << " query_threads_per_request=" << query_threads_per_request
+              << " query_thread_budget=" << query_thread_budget
+              << " insert_threads="
               << lire.insert_threads << " maintenance_threads="
               << lire.maintenance_threads << " update_thread_budget="
               << update_thread_budget << " max_maintenance_backlog="
@@ -682,6 +717,7 @@ int main(int argc, char** argv) {
     std::cout << "[QUERY] stopping admission" << std::endl;
     stop_queries.store(true, std::memory_order_relaxed);
     for (auto& worker : workers) if (worker.joinable()) worker.join();
+    query_teams.clear();
     const double streaming_workload_end_ms = elapsed_ms();
     const LireMaintenanceStats stats_at_stream_end = index.maintenance_stats();
     std::cout << "[QUERY] workers joined completed=" << query_records.size()
@@ -707,7 +743,8 @@ int main(int argc, char** argv) {
     index.stop_maintenance_workers();
     const LireMaintenanceStats final_maintenance_stats = index.maintenance_stats();
     WriteOutputs(summary_path, config_path, base_path, query_path, gt_path,
-        cfg.topk, qthreads, lire.insert_threads, lire.maintenance_threads,
+        cfg.topk, query_workers, query_threads_per_request,
+        lire.insert_threads, lire.maintenance_threads,
         update_thread_budget, max_maintenance_backlog, insert_rate_limit,
         initial_rows, final_rows, first_batch_end, cap_seen,
         max_insert_vectors, query.n,

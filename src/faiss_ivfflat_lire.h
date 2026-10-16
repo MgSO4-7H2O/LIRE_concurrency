@@ -8,6 +8,7 @@
 #include <chrono>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -17,6 +18,25 @@
 #include <vector>
 
 namespace baseline_eval {
+
+// A reusable, fixed-size team for parallel work inside one logical query.
+// The calling thread is team member 0; the remaining members are persistent
+// helper threads created with the team.
+class QuerySearchTeam final {
+ public:
+  explicit QuerySearchTeam(uint32_t thread_count);
+  ~QuerySearchTeam();
+  QuerySearchTeam(const QuerySearchTeam&) = delete;
+  QuerySearchTeam& operator=(const QuerySearchTeam&) = delete;
+
+  uint32_t thread_count() const;
+  void parallel_for(size_t task_count,
+                    const std::function<void(uint32_t, size_t)>& task);
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 struct LireConfig {
   uint32_t initial_nlist{0};
@@ -91,7 +111,8 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
                           faiss::idx_t k,
                           float* distances,
                           faiss::idx_t* labels,
-                          faiss::idx_t visible_rows) const;
+                          faiss::idx_t visible_rows,
+                          QuerySearchTeam* query_team = nullptr) const;
 
   uint32_t active_nlist() const;
   uint64_t split_count() const;
