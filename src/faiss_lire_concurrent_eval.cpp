@@ -128,6 +128,15 @@ struct InsertRecord {
   uint64_t maintenance_completed_jobs{0};
   uint64_t maintenance_peak_pending_jobs{0};
   uint64_t maintenance_stale_retries{0};
+  uint64_t split_jobs_enqueued{0};
+  uint64_t split_jobs_completed{0};
+  uint64_t reassign_jobs_enqueued{0};
+  uint64_t reassign_jobs_started{0};
+  uint64_t reassign_jobs_completed{0};
+  uint64_t reassign_jobs_dropped_stale{0};
+  uint64_t reassign_jobs_noop_same_target{0};
+  uint64_t reassign_vectors_moved{0};
+  uint64_t stale_physical_copies_filtered{0};
   uint64_t oversized_active_lists{0};
   uint64_t newly_oversized_lists{0};
 };
@@ -205,7 +214,7 @@ void WriteOutputs(const std::string& summary_path,
   const std::string progress_path = (dir / (stem + "_progress.csv")).string();
 
   std::ofstream insert_csv(insert_path);
-  insert_csv << "batch,begin_row,end_row,start_ms,end_ms,insert_latency_ms,insert_throughput_vecps,maintenance_pending_jobs,maintenance_running_jobs,maintenance_completed_jobs,maintenance_peak_pending_jobs,maintenance_stale_retries,oversized_active_lists,newly_oversized_lists\n";
+  insert_csv << "batch,begin_row,end_row,start_ms,end_ms,insert_latency_ms,insert_throughput_vecps,maintenance_pending_jobs,maintenance_running_jobs,maintenance_completed_jobs,maintenance_peak_pending_jobs,maintenance_stale_retries,split_jobs_enqueued,split_jobs_completed,reassign_jobs_enqueued,reassign_jobs_started,reassign_jobs_completed,reassign_jobs_dropped_stale,reassign_jobs_noop_same_target,reassign_vectors_moved,stale_physical_copies_filtered,oversized_active_lists,newly_oversized_lists\n";
   for (const auto& record : inserts)
     insert_csv << record.batch << ',' << record.begin_row << ',' << record.end_row << ','
                << record.start_ms << ',' << record.end_ms << ',' << record.latency_ms << ','
@@ -213,6 +222,15 @@ void WriteOutputs(const std::string& summary_path,
                << record.maintenance_running_jobs << ',' << record.maintenance_completed_jobs
                << ',' << record.maintenance_peak_pending_jobs << ','
                << record.maintenance_stale_retries << ','
+               << record.split_jobs_enqueued << ','
+               << record.split_jobs_completed << ','
+               << record.reassign_jobs_enqueued << ','
+               << record.reassign_jobs_started << ','
+               << record.reassign_jobs_completed << ','
+               << record.reassign_jobs_dropped_stale << ','
+               << record.reassign_jobs_noop_same_target << ','
+               << record.reassign_vectors_moved << ','
+               << record.stale_physical_copies_filtered << ','
                << record.oversized_active_lists << ','
                << record.newly_oversized_lists << '\n';
 
@@ -224,7 +242,7 @@ void WriteOutputs(const std::string& summary_path,
       if (i) affected << ';';
       affected << event.affected_list_ids[i];
     }
-    event_csv << event.job_id << ",lire_maintenance," << event.triggering_list << ','
+    event_csv << event.job_id << ',' << event.type << ',' << event.triggering_list << ','
               << event.request_ms << ',' << event.start_ms << ',' << event.compute_done_ms
               << ',' << event.commit_done_ms << ',' << event.end_ms << ','
               << event.queue_wait_ms << ',' << event.execution_ms << ','
@@ -379,6 +397,24 @@ void WriteOutputs(const std::string& summary_path,
        << final_maintenance_stats.jobs_completed
        << ",\n  \"maintenance_jobs_retried\": "
        << final_maintenance_stats.jobs_retried
+       << ",\n  \"split_jobs_enqueued\": "
+       << final_maintenance_stats.split_jobs_enqueued
+       << ",\n  \"split_jobs_completed\": "
+       << final_maintenance_stats.split_jobs_completed
+       << ",\n  \"reassign_jobs_enqueued\": "
+       << final_maintenance_stats.reassign_jobs_enqueued
+       << ",\n  \"reassign_jobs_started\": "
+       << final_maintenance_stats.reassign_jobs_started
+       << ",\n  \"reassign_jobs_completed\": "
+       << final_maintenance_stats.reassign_jobs_completed
+       << ",\n  \"reassign_jobs_dropped_stale\": "
+       << final_maintenance_stats.reassign_jobs_dropped_stale
+       << ",\n  \"reassign_jobs_noop_same_target\": "
+       << final_maintenance_stats.reassign_jobs_noop_same_target
+       << ",\n  \"reassign_vectors_moved\": "
+       << final_maintenance_stats.reassign_vectors_moved
+       << ",\n  \"stale_physical_copies_filtered\": "
+       << final_maintenance_stats.stale_physical_copies_filtered
        << ",\n  \"stale_retries_per_completed_job\": ";
   if (final_maintenance_stats.jobs_completed > 0) {
     json << static_cast<double>(final_maintenance_stats.jobs_retried) /
@@ -721,6 +757,19 @@ int main(int argc, char** argv) {
       insert_records.back().maintenance_completed_jobs = batch_maintenance.jobs_completed;
       insert_records.back().maintenance_peak_pending_jobs = batch_maintenance.peak_pending_jobs;
       insert_records.back().maintenance_stale_retries = batch_maintenance.jobs_retried;
+      insert_records.back().split_jobs_enqueued = batch_maintenance.split_jobs_enqueued;
+      insert_records.back().split_jobs_completed = batch_maintenance.split_jobs_completed;
+      insert_records.back().reassign_jobs_enqueued = batch_maintenance.reassign_jobs_enqueued;
+      insert_records.back().reassign_jobs_started = batch_maintenance.reassign_jobs_started;
+      insert_records.back().reassign_jobs_completed = batch_maintenance.reassign_jobs_completed;
+      insert_records.back().reassign_jobs_dropped_stale =
+          batch_maintenance.reassign_jobs_dropped_stale;
+      insert_records.back().reassign_jobs_noop_same_target =
+          batch_maintenance.reassign_jobs_noop_same_target;
+      insert_records.back().reassign_vectors_moved =
+          batch_maintenance.reassign_vectors_moved;
+      insert_records.back().stale_physical_copies_filtered =
+          batch_maintenance.stale_physical_copies_filtered;
       std::cout << "[INSERT_PROGRESS] batch=" << (record.batch + 1) << "/"
                 << total_batches << " rows=[" << begin << "," << end
                 << ") insert_ms=" << record.latency_ms
@@ -734,6 +783,17 @@ int main(int argc, char** argv) {
                 << " maintenance_pending=" << batch_maintenance.pending_jobs
                 << " maintenance_peak_pending=" << batch_maintenance.peak_pending_jobs
                 << " maintenance_stale_retries=" << batch_maintenance.jobs_retried
+                << " split_jobs_enqueued=" << batch_maintenance.split_jobs_enqueued
+                << " split_jobs_completed=" << batch_maintenance.split_jobs_completed
+                << " reassign_jobs_enqueued=" << batch_maintenance.reassign_jobs_enqueued
+                << " reassign_jobs_started=" << batch_maintenance.reassign_jobs_started
+                << " reassign_jobs_completed=" << batch_maintenance.reassign_jobs_completed
+                << " reassign_jobs_dropped_stale="
+                << batch_maintenance.reassign_jobs_dropped_stale
+                << " reassign_vectors_moved="
+                << batch_maintenance.reassign_vectors_moved
+                << " stale_physical_copies_filtered="
+                << batch_maintenance.stale_physical_copies_filtered
                 << " oversized_active_lists=" << record.oversized_active_lists
                 << " newly_oversized_lists=" << record.newly_oversized_lists
                 << std::endl;

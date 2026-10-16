@@ -64,27 +64,52 @@ release schedule restarts from that admission point, as it does in DiSPQ.
 Measured `insert_throughput_vecps` remains the actual time spent in
 `add_with_ids()` and is not the configured arrival rate.
 
-`--max-maintenance-backlog N` is the queued-job threshold used before admitting
-the next dynamic batch. When the queue exceeds N, the foreground stream waits
-until it falls to N or fewer; Query and maintenance continue during that wait.
-Jobs are deduplicated by physical list. One batch can enqueue work for several
-lists, so the queue can briefly exceed the threshold by that batch's fan-out;
-the threshold gates subsequent batch admission and prevents debt growing
-without bound across batches. If omitted, the threshold is twice the number of
-maintenance workers (minimum one).
+`--max-maintenance-backlog N` bounds the combined pending SplitJob and
+ReassignJob queue before admitting the next dynamic batch. When the queue
+exceeds N, the foreground stream waits until it falls to N or fewer; Query and
+maintenance continue during that wait. Split jobs for the same physical list
+are deduplicated. One split can enqueue many per-vector reassignments, so the
+queue can briefly exceed the threshold by that split's fan-out; the threshold
+gates subsequent batch admission. If omitted, the threshold is twice the
+number of maintenance workers (minimum one).
 
-Maintenance work on separate lists can compute in parallel. A split records
-the source-list generation and centroid-topology generation before clustering.
-Before publishing children it validates both again. Reassignment snapshots
-the relevant child and neighbor list generations plus topology generation;
-publication checks them before applying moves. Stale split work is requeued;
-stale reassignment computation is discarded and retried from a fresh snapshot.
-Jobs for the same physical list are deduplicated. Multi-list locks are always
-acquired by ascending list ID. The shared state lock still serializes the
-short publication step and protects the Faiss active-centroid index; clustering
-and candidate discovery run outside its exclusive section. Reassignment
-publication currently materializes and rewrites affected lists while holding
-that lock, so query routing can pause during this commit.
+The internal maintenance pipeline follows SPFresh/LIRE's split and
+reassignment shape. A SplitJob locks its source posting and a reserved child
+posting in ascending list-ID order, reads the current source contents, filters
+copies whose logical membership points elsewhere, and runs the existing
+balanced K=2 split. Disjoint postings can split concurrently. Only short
+topology publication takes the global state lock. Lock order is posting locks
+in ascending ID order, then the state lock, then membership. Inserts and
+per-vector reassignment use the same order, avoiding a state/list ABBA cycle.
+
+After publication, candidate discovery scans the two children and up to
+`lire_reassign_k` nearby lists. It only submits individual ReassignJobs; its
+snapshot is not a commit transaction. Jobs carry an ID and previous list, not
+a second vector payload. At execution, each job checks the vector's current
+membership and reads its data from that authoritative posting. It routes again
+against current active centroids, locks the previous and target postings in
+ascending order, appends the physical target copy, and then updates the
+authoritative `membership[id]`. A job whose previous membership has changed is
+dropped cheaply. Existing obsolete copies can remain in old postings; Query
+filters a copy unless `membership[id]` equals the scanned list, and later
+splits reclaim such copies. This single-assignment Faiss adaptation does not
+copy SPFresh's replicated SPANN layout or VersionLabel representation: logical
+membership is the version/location authority, with one current posting per
+vector.
+
+This evaluator uses one configured maintenance pool for both SplitJobs and
+ReassignJobs. In the inspected SPFresh source, `ReassignAsync()` submits to
+`m_splitThreadPool`; although a separate reassign pool is initialized and
+included in `AllFinished()`, that method is not its submission path. The local
+single-pool queue therefore follows the observed submission path without
+adding unbudgeted workers. `topology_generation_` is used only to refresh a
+vector's routing decision if topology changes while it waits for posting
+locks; it does not invalidate or restart neighborhood discovery. The summary
+and insert CSV expose split/reassign job counts, stale job drops, successful
+moves, and stale physical copies filtered. Query routing validates its
+topology snapshot after acquiring the selected posting locks; it reroutes if a
+split published in the gap, so it never scans an old route set against newly
+published split postings.
 
 The evaluator writes `SUMMARY.json`, `SUMMARY_timeseries.csv`,
 `SUMMARY_insert.csv`, `SUMMARY_events.csv`, and `SUMMARY_progress.csv`.
@@ -98,11 +123,13 @@ workload duration through query worker join, never the later maintenance
 drain.
 
 The summary records streaming start/end/duration, maintenance drain start/end
-and duration, maintenance jobs enqueued/started/completed/retried, peak and
-stream-end backlog, queue wait, and execution time. The insert CSV carries
-backlog snapshots; the events CSV includes per-job queue wait, execution, and
-stale retry counts. `compute_done_ms`, `commit_done_ms`, and `end_ms` remain
-coarse job timestamps and do not claim independent phase measurements.
+and duration, split/reassign job counts, stale reassign drops, successful
+moves, stale physical copies filtered, peak and stream-end backlog, queue wait,
+and execution time. The insert CSV carries those counters and backlog
+snapshots. The events CSV retains one event per SplitJob; aggregate queue-wait
+and execution totals include both SplitJobs and ReassignJobs.
+`compute_done_ms`, `commit_done_ms`, and `end_ms` remain coarse job timestamps
+and do not claim independent phase measurements.
 
 For fair comparison, keep query workers, query threads per request, dataset,
 GT, batch schedule, external insert rate, and total update-side thread budget
@@ -117,7 +144,9 @@ For small functional checks, use `--max-insert-vectors`, `--query-workers 2`
 or `4`, `--query-threads-per-request 1` or `3`, `--insert-threads 1`, and a maintenance-thread count that fits the
 update budget. Enable `lire_validate_invariants` in a small run to validate
 membership and inverted-list consistency after initial build and final
-maintenance drain. The supplied SIFT1M config's current 4,096-list,
-210,000-initial-row, 10,000-row batch, and 128 split threshold values are
-unchanged here; collect backlog and drain measurements before tuning the
-trigger threshold.
+maintenance drain. The supplied SIFT1M candidate config uses 4,096 lists,
+210,000 initial rows, 10,000-row batches, `lire_split_threshold=384`, and
+`lire_reassign_k=64`. This threshold is held fixed for the execution-model
+check, not claimed as a final tuned value. Its
+`lire_validate_invariants=true` setting checks membership/list consistency
+after the initial build and after the streaming maintenance drain.

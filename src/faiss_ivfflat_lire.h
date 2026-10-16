@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -54,6 +55,7 @@ struct LireConfig {
 
 struct LireMaintenanceEvent {
   uint64_t job_id{0};
+  std::string type{"lire_split"};
   faiss::idx_t triggering_list{-1};
   double request_ms{0.0};
   double start_ms{0.0};
@@ -79,6 +81,15 @@ struct LireMaintenanceStats {
   uint64_t peak_pending_jobs{0};
   double total_queue_wait_ms{0.0};
   double total_execution_ms{0.0};
+  uint64_t split_jobs_enqueued{0};
+  uint64_t split_jobs_completed{0};
+  uint64_t reassign_jobs_enqueued{0};
+  uint64_t reassign_jobs_started{0};
+  uint64_t reassign_jobs_completed{0};
+  uint64_t reassign_jobs_dropped_stale{0};
+  uint64_t reassign_jobs_noop_same_target{0};
+  uint64_t reassign_vectors_moved{0};
+  uint64_t stale_physical_copies_filtered{0};
 };
 
 struct LireOversizedListStats {
@@ -139,18 +150,18 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
     }
   };
 
-  struct Move {
-    faiss::idx_t id{-1};
-    faiss::idx_t source{-1};
-    faiss::idx_t target{-1};
-    std::vector<float> vector;
+  struct MaintenanceJob {
+    enum class Kind { Split, Reassign };
+    Kind kind{Kind::Split};
+    faiss::idx_t triggering_list{-1};
+    faiss::idx_t vector_id{-1};
+    faiss::idx_t previous_slot{-1};
+    double request_ms{0.0};
   };
 
   struct MaintenanceResult {
     uint32_t split_count{0};
-    uint64_t reassigned_vectors{0};
     uint64_t stale_retries{0};
-    bool stale{false};
     std::vector<faiss::idx_t> affected_lists;
   };
 
@@ -176,28 +187,21 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
       std::vector<float>* centers);
   std::vector<faiss::idx_t> split_one(faiss::idx_t slot,
                                       bool* did_split,
-                                      uint64_t* reassigned_vectors,
-                                      bool* stale,
-                                      uint64_t* stale_retries);
-  std::vector<faiss::idx_t> collect_and_reassign(
-      faiss::idx_t old_slot,
+                                      uint64_t* stale_copies_filtered);
+  void collect_and_reassign(
       const std::vector<float>& old_center,
       faiss::idx_t child0,
       faiss::idx_t child1,
-      uint64_t* reassigned_vectors,
-      uint64_t* stale_retries);
-  uint64_t apply_moves(
-      const std::vector<Move>& moves,
-      faiss::idx_t old_slot,
-      const std::vector<float>& old_center,
-      const std::vector<faiss::idx_t>& expected_neighbors,
-      const std::vector<uint64_t>& validated_centroid_generations,
-      const std::vector<std::pair<faiss::idx_t, uint64_t>>& expected_generations,
-      bool* stale,
-      std::vector<faiss::idx_t>* changed_lists);
+      uint64_t* stale_copies_filtered);
+  bool run_reassign(const MaintenanceJob& job,
+                    bool* dropped_stale,
+                    bool* noop_same_target,
+                    faiss::idx_t* target_slot);
   MaintenanceResult run_maintenance(const std::vector<faiss::idx_t>& touched);
   MaintenanceResult run_maintenance_one(faiss::idx_t slot);
   void enqueue_maintenance(faiss::idx_t slot);
+  void enqueue_reassign(MaintenanceJob job);
+  void enqueue_job(MaintenanceJob job);
   void maintenance_worker();
   void note_oversized_list_state(faiss::idx_t slot,
                                  bool active,
@@ -210,20 +214,20 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
   uint32_t max_nlist_{0};
   uint32_t active_nlist_{0};
   std::vector<float> centroids_;
-  std::vector<uint64_t> centroid_generation_;
   std::vector<uint8_t> active_;
   std::vector<faiss::idx_t> free_slots_;
   std::vector<faiss::idx_t> membership_;
+  uint64_t topology_generation_{0};
   std::atomic<uint64_t> split_serial_{0};
   uint64_t split_count_{0};
   std::atomic<uint64_t> reassign_scanned_{0};
-  uint64_t reassign_moved_{0};
+  std::atomic<uint64_t> reassign_moved_{0};
+  std::atomic<uint64_t> stale_physical_copies_filtered_{0};
   std::vector<std::unique_ptr<std::shared_mutex>> list_mutexes_;
-  std::vector<uint64_t> list_generation_;
   std::atomic<faiss::idx_t> published_rows_{0};
   mutable std::mutex insert_mutex_;
   mutable std::shared_mutex state_mutex_;
-  mutable std::mutex membership_mutex_;
+  mutable std::shared_mutex membership_mutex_;
   mutable std::mutex oversized_stats_mutex_;
   mutable std::vector<uint8_t> previous_oversized_lists_;
   mutable std::vector<uint8_t> newly_oversized_since_sample_;
@@ -231,9 +235,8 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
   mutable std::mutex maintenance_queue_mutex_;
   std::condition_variable maintenance_queue_cv_;
   std::condition_variable maintenance_idle_cv_;
-  std::deque<faiss::idx_t> maintenance_queue_;
+  std::deque<MaintenanceJob> maintenance_queue_;
   std::vector<uint8_t> maintenance_queued_or_running_;
-  std::vector<double> maintenance_request_ms_;
   std::vector<std::thread> maintenance_workers_;
   bool maintenance_started_{false};
   bool maintenance_stopping_{false};
@@ -245,6 +248,14 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
   uint64_t maintenance_peak_pending_jobs_{0};
   double maintenance_total_queue_wait_ms_{0.0};
   double maintenance_total_execution_ms_{0.0};
+  uint64_t split_jobs_enqueued_{0};
+  uint64_t split_jobs_completed_{0};
+  uint64_t reassign_jobs_enqueued_{0};
+  uint64_t reassign_jobs_started_{0};
+  uint64_t reassign_jobs_completed_{0};
+  uint64_t reassign_jobs_dropped_stale_{0};
+  uint64_t reassign_jobs_noop_same_target_{0};
+  uint64_t reassign_vectors_moved_{0};
   std::exception_ptr maintenance_error_;
   mutable std::mutex maintenance_events_mutex_;
   std::vector<LireMaintenanceEvent> maintenance_events_;
