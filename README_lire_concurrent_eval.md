@@ -1,68 +1,103 @@
 # Concurrent Faiss-based LIRE evaluator
 
-`build/faiss_lire_concurrent_eval` is the first functional concurrent LIRE
-version. Query workers, the foreground insertion stream, and the background
-LIRE maintenance worker can overlap. Inserts are dispatched as one sequential
-batch stream; the evaluator does not run multiple frontend `add_with_ids()`
-workers.
+`build/faiss_lire_concurrent_eval` runs a concurrent Faiss-based reproduction
+of LIRE. Initial build and its maintenance drain finish before measurement.
+During measurement, one sequential foreground insert stream, fixed query
+workers, and background LIRE maintenance run together. After the last dynamic
+insert batch completes, the evaluator stops admitting queries and joins all
+in-flight queries. It records the streaming workload end at that point, then
+drains residual maintenance separately. That residual drain is excluded from
+query count, QPS, latency, recall, progress, and streaming workload duration.
 
-The evaluator reads an existing LIRE JSON config, a dataset directory (with
-`_base.fvecs` and `_query.fvecs`), and a DiSPQ concurrent GT artifact:
+Example:
 
 ```bash
 ./build/faiss_lire_concurrent_eval CONFIG.json DATASET_DIR DISP_GT.gt SUMMARY.json \
   --max-insert-vectors 30000 \
-  --query-threads 4 --insert-threads 1 --maintenance-threads 1
+  --query-threads 8 \
+  --insert-threads 1 \
+  --maintenance-threads 3 \
+  --update-thread-budget 4 \
+  --insert-rate-limit 10000 \
+  --max-maintenance-backlog 6
 ```
 
-`--max-insert-vectors` limits only rows after `main_index_rows`; the capped run
-constructs and validates its own exact frontier sequence against the GT
-artifact. `snapshot_interval` is the dynamic insert batch size. GT validation
-checks magic/version, base and query path identities, query count, top-k,
-initial row count, batch size, frontier count, every frontier, and trailing
-bytes. Generate the artifact using the same resolved base/query paths and
-workload parameters.
+Use the same `--query-threads` value and external insert rate cap as DiSPQ.
+`--query-threads N` means N concurrent query workers; each query uses one
+software/Faiss search thread. The query resources do not change when the
+update-side split changes. `--insert-threads N` configures the Faiss/OpenMP
+coarse assignment inside the single foreground insert stream; it does not
+create N frontend insert workers. `--maintenance-threads N` starts N LIRE
+background workers. `--update-thread-budget` checks that
+`insert_threads + maintenance_threads` does not exceed the update-side CPU
+budget. Query workers are accounted for separately. Faiss/OpenMP nested
+parallelism is disabled for the insert assignment region; maintenance jobs do
+not create nested OpenMP teams. If omitted, the update-side budget defaults to
+2, matching the default one insert thread plus one maintenance thread; larger
+thread splits require an explicit budget.
 
-This first version supports raw L2 fvecs. Query workers run Faiss search with
-one software thread each. `--insert-threads` sets the insert-side
-Faiss/OpenMP coarse-assignment thread count; it does not create frontend insert
-workers. There is one foreground insert stream and its batches are dispatched
-sequentially. `--maintenance-threads` currently accepts only `1`: concurrent
-maintenance workers need complete generation validation for neighboring-list
-and centroid snapshots, which is not implemented in this phase. Use
-`--query-threads 2` to `4`, `--insert-threads 1`, and
-`--maintenance-threads 1` for the first functional run.
+The external insert rate is a batch-arrival cap in vectors per second. For
+batch size B and rate R, successive batch release times are spaced by B/R
+seconds, matching DiSPQ's `concurrent_target_insert_vecps` pacing. A slow batch
+does not get skipped. If backlog backpressure delays admission, the next
+release schedule restarts from that admission point, as it does in DiSPQ.
+Measured `insert_throughput_vecps` remains the actual time spent in
+`add_with_ids()` and is not the configured arrival rate.
 
-`*_progress.csv` contains one row per completed dynamic insert batch. Its
-progress is calculated from actual `end_row` values: the first completed
-dynamic batch is 0% and the final completed batch is 100%. A run with one
-dynamic batch assigns that point 100%; a run with no dynamic inserts has no
-progress data rows. The initial-only frontier remains in the GT sequence for
-queries before the first batch completes, but it is not a progress point.
-Progress metrics group queries by completion time in that batch's
-`[start_ms, end_ms]` interval. QPS is `query_count / batch_duration_seconds`.
-For an interval with no completed queries, query count and QPS are 0 and the
-recall and latency fields are empty.
+`--max-maintenance-backlog N` is the queued-job threshold used before admitting
+the next dynamic batch. When the queue exceeds N, the foreground stream waits
+until it falls to N or fewer; Query and maintenance continue during that wait.
+Jobs are deduplicated by physical list. One batch can enqueue work for several
+lists, so the queue can briefly exceed the threshold by that batch's fan-out;
+the threshold gates subsequent batch admission and prevents debt growing
+without bound across batches. If omitted, the threshold is twice the number of
+maintenance workers (minimum one).
 
-Maintenance event timestamps currently describe coarse job timing;
-`compute_done_ms`, `commit_done_ms`, and `end_ms` do not independently measure
-precise compute and publication phases. `apply_moves()` retains a conservative
-global state lock while it materializes and rewrites affected lists, so query
-routing can pause during reassignment commit. This is retained for the
-first correctness pass and can be revisited after SIFT1M measurements.
+Maintenance work on separate lists can compute in parallel. A split records
+the source-list generation and centroid-topology generation before clustering.
+Before publishing children it validates both again. Reassignment snapshots
+the relevant child and neighbor list generations plus topology generation;
+publication checks them before applying moves. Stale split work is requeued;
+stale reassignment computation is discarded and retried from a fresh snapshot.
+Jobs for the same physical list are deduplicated. Multi-list locks are always
+acquired by ascending list ID. The shared state lock still serializes the
+short publication step and protects the Faiss active-centroid index; clustering
+and candidate discovery run outside its exclusive section. Reassignment
+publication currently materializes and rewrites affected lists while holding
+that lock, so query routing can pause during this commit.
 
 The evaluator writes `SUMMARY.json`, `SUMMARY_timeseries.csv`,
-`SUMMARY_insert.csv`, `SUMMARY_events.csv`, and `SUMMARY_progress.csv`. Plot
-generation is not included. Formal performance tuning and AVX target tuning
-have not started; the current CMake Faiss CPU target is unchanged. Deletion is
-not supported.
+`SUMMARY_insert.csv`, `SUMMARY_events.csv`, and `SUMMARY_progress.csv`.
+Progress contains one point per actual dynamic insert batch. The initial-only
+GT frontier remains available to queries but is not a progress point. The
+first completed dynamic batch is 0%; the last is 100% (a sole batch is 100%).
+Each point groups query completions in that batch's `[start_ms, end_ms]`
+interval and divides its query count by the batch duration. Empty intervals
+write zero query count/QPS and blank recall/latency. Streaming QPS uses the
+workload duration through query worker join, never the later maintenance
+drain.
 
-## SIFT1M functional configuration
+The summary records streaming start/end/duration, maintenance drain start/end
+and duration, maintenance jobs enqueued/started/completed/retried, peak and
+stream-end backlog, queue wait, and execution time. The insert CSV carries
+backlog snapshots; the events CSV includes per-job queue wait, execution, and
+stale retry counts. `compute_done_ms`, `commit_done_ms`, and `end_ms` remain
+coarse job timestamps and do not claim independent phase measurements.
 
-`configs/ivfflat_lire_concurrent_sift1m.json` is sized for a small functional
-check: 50,000 initial rows, 5,000-row dynamic batches, and a split threshold
-chosen so a 30,000-row insertion cap is likely to trigger maintenance. Prepare
-the matching DiSPQ GT artifact with 1,000 queries, top-k 10, raw L2, initial
-rows 50,000, batch size 5,000, and frontiers 50,000 through 80,000 in steps of
-5,000. Pass `--max-insert-vectors 30000` to use that same truncated frontier
-range.
+For fair comparison, keep query workers, query threads per request, dataset,
+GT, batch schedule, external insert rate, and total update-side thread budget
+aligned with DiSPQ. The insert/maintenance thread split can be tuned for LIRE's
+foreground-updater/background-local-rebuilder pipeline; DiSPQ's internal
+maintenance model is not imported. The split, neighbor discovery, reassignment
+conditions, and local publication remain LIRE-specific. This evaluator supports
+raw L2 fvecs and insert-only workloads; deletion and plotting are not
+implemented. AVX and formal performance tuning remain deferred.
+
+For small functional checks, use `--max-insert-vectors`, `--query-threads 2`
+or `4`, `--insert-threads 1`, and a maintenance-thread count that fits the
+update budget. Enable `lire_validate_invariants` in a small run to validate
+membership and inverted-list consistency after initial build and final
+maintenance drain. The supplied SIFT1M config's current 4,096-list,
+210,000-initial-row, 10,000-row batch, and 128 split threshold values are
+unchanged here; collect backlog and drain measurements before tuning the
+trigger threshold.

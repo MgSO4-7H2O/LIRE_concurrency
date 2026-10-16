@@ -92,6 +92,19 @@ uint64_t ParseUint64(const std::string& text, const std::string& option) {
   return value;
 }
 
+double ParsePositiveDouble(const std::string& text, const std::string& option) {
+  size_t parsed = 0;
+  double value = 0.0;
+  try {
+    value = std::stod(text, &parsed);
+  } catch (...) {
+    throw std::runtime_error("Invalid number for " + option + ": " + text);
+  }
+  if (parsed != text.size() || !std::isfinite(value) || value <= 0.0)
+    throw std::runtime_error(option + " must be a finite positive number");
+  return value;
+}
+
 struct QueryRecord {
   uint32_t query_id{0};
   uint32_t frontier{0};
@@ -110,6 +123,11 @@ struct InsertRecord {
   double end_ms{0.0};
   double latency_ms{0.0};
   double throughput{0.0};
+  uint64_t maintenance_pending_jobs{0};
+  uint64_t maintenance_running_jobs{0};
+  uint64_t maintenance_completed_jobs{0};
+  uint64_t maintenance_peak_pending_jobs{0};
+  uint64_t maintenance_stale_retries{0};
 };
 
 struct QueryWorkerJoiner {
@@ -149,7 +167,10 @@ void WriteOutputs(const std::string& summary_path,
                   uint32_t topk,
                   uint32_t query_workers,
                   uint32_t insert_threads,
-                  uint32_t maintenance_workers,
+                  uint32_t maintenance_threads,
+                  uint32_t update_thread_budget,
+                  uint64_t max_maintenance_backlog,
+                  double insert_rate_limit,
                   uint32_t initial_rows,
                   uint32_t final_rows,
                   uint32_t first_batch_end,
@@ -160,7 +181,16 @@ void WriteOutputs(const std::string& summary_path,
                   const std::vector<InsertRecord>& inserts,
                   const std::vector<LireMaintenanceEvent>& events,
                   const IndexIVFFlatLIRE& index,
-                  double total_ms) {
+                  double streaming_workload_start_ms,
+                  double streaming_workload_end_ms,
+                  double maintenance_drain_start_ms,
+                  double maintenance_drain_end_ms,
+                  const LireMaintenanceStats& stats_at_stream_end,
+                  const LireMaintenanceStats& final_maintenance_stats) {
+  const double total_ms = std::max(0.0,
+      streaming_workload_end_ms - streaming_workload_start_ms);
+  const double maintenance_drain_ms = std::max(0.0,
+      maintenance_drain_end_ms - maintenance_drain_start_ms);
   namespace fs = std::filesystem;
   const fs::path summary(summary_path);
   const std::string stem = summary.stem().string();
@@ -172,14 +202,17 @@ void WriteOutputs(const std::string& summary_path,
   const std::string progress_path = (dir / (stem + "_progress.csv")).string();
 
   std::ofstream insert_csv(insert_path);
-  insert_csv << "batch,begin_row,end_row,start_ms,end_ms,insert_latency_ms,insert_throughput_vecps\n";
+  insert_csv << "batch,begin_row,end_row,start_ms,end_ms,insert_latency_ms,insert_throughput_vecps,maintenance_pending_jobs,maintenance_running_jobs,maintenance_completed_jobs,maintenance_peak_pending_jobs,maintenance_stale_retries\n";
   for (const auto& record : inserts)
     insert_csv << record.batch << ',' << record.begin_row << ',' << record.end_row << ','
                << record.start_ms << ',' << record.end_ms << ',' << record.latency_ms << ','
-               << record.throughput << '\n';
+               << record.throughput << ',' << record.maintenance_pending_jobs << ','
+               << record.maintenance_running_jobs << ',' << record.maintenance_completed_jobs
+               << ',' << record.maintenance_peak_pending_jobs << ','
+               << record.maintenance_stale_retries << '\n';
 
   std::ofstream event_csv(events_path);
-  event_csv << "event_id,type,triggering_list,request_ms,start_ms,compute_done_ms,commit_done_ms,end_ms,affected_lists,affected_list_count,split_count,reassigned_vectors\n";
+  event_csv << "event_id,type,triggering_list,request_ms,start_ms,compute_done_ms,commit_done_ms,end_ms,queue_wait_ms,execution_ms,stale_retries,affected_lists,affected_list_count,split_count,reassigned_vectors\n";
   for (const auto& event : events) {
     std::ostringstream affected;
     for (size_t i = 0; i < event.affected_list_ids.size(); ++i) {
@@ -189,6 +222,8 @@ void WriteOutputs(const std::string& summary_path,
     event_csv << event.job_id << ",lire_maintenance," << event.triggering_list << ','
               << event.request_ms << ',' << event.start_ms << ',' << event.compute_done_ms
               << ',' << event.commit_done_ms << ',' << event.end_ms << ','
+              << event.queue_wait_ms << ',' << event.execution_ms << ','
+              << event.stale_retries << ','
               << '"' << affected.str() << "\"," << event.affected_lists << ','
               << event.split_count << ','
               << event.reassigned_vectors << '\n';
@@ -254,9 +289,12 @@ void WriteOutputs(const std::string& summary_path,
     progress_csv << ',' << batch.latency_ms << ',' << batch.throughput << '\n';
   }
   for (const auto& [bucket, group] : by_time) {
+    const double window_start_ms = static_cast<double>(bucket) * 200.0;
+    const double window_end_ms = std::min(total_ms, window_start_ms + 200.0);
+    const double window_seconds = std::max(0.0, window_end_ms - window_start_ms) / 1000.0;
     uint32_t frontier = initial_rows;
     for (const QueryRecord* record : group) frontier = std::max(frontier, record->frontier);
-    timeseries_csv << (bucket + 1) * 200 << ',';
+    timeseries_csv << window_end_ms << ',';
     std::vector<double> latencies;
     double recall = 0.0;
     for (const QueryRecord* record : group) {
@@ -265,7 +303,7 @@ void WriteOutputs(const std::string& summary_path,
     }
     const double mean = latencies.empty() ? 0.0 :
         std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
-    const double qps = latencies.size() / 0.2;
+    const double qps = window_seconds > 0.0 ? latencies.size() / window_seconds : 0.0;
     timeseries_csv << ProgressForFrontier(frontier, initial_rows, final_rows, first_batch_end)
                    << ',' << frontier << ',' << latencies.size() << ',' << qps << ',' << mean
                    << ',' << Percentile(latencies, .50) << ',' << Percentile(latencies, .95)
@@ -283,6 +321,8 @@ void WriteOutputs(const std::string& summary_path,
   const double mean_latency = all_latencies.empty() ? 0.0 :
       std::accumulate(all_latencies.begin(), all_latencies.end(), 0.0) / all_latencies.size();
   const double qps = total_ms > 0.0 ? queries.size() / (total_ms / 1000.0) : 0.0;
+  const double realized_insert_arrival_vecps = total_ms > 0.0
+      ? (final_rows - initial_rows) * 1000.0 / total_ms : 0.0;
   std::ofstream json(summary_path);
   json << "{\n  \"algorithm\": \"Faiss-based LIRE concurrent\",\n"
        << "  \"config\": \"" << JsonEscape(config_path) << "\",\n"
@@ -292,7 +332,15 @@ void WriteOutputs(const std::string& summary_path,
        << "  \"topk\": " << topk << ",\n"
        << "  \"query_workers\": " << query_workers << ",\n"
        << "  \"insert_threads\": " << insert_threads << ",\n"
-       << "  \"maintenance_workers\": " << maintenance_workers << ",\n"
+       << "  \"query_threads_per_request\": 1,\n"
+       << "  \"frontend_insert_streams\": 1,\n"
+       << "  \"maintenance_threads\": " << maintenance_threads << ",\n"
+       << "  \"update_thread_budget\": " << update_thread_budget << ",\n"
+       << "  \"insert_rate_limit_vecps\": ";
+  if (insert_rate_limit > 0.0) json << insert_rate_limit;
+  else json << "null";
+  json << ",\n  \"max_maintenance_backlog\": " << max_maintenance_backlog << ",\n"
+       << "  \"realized_insert_arrival_vecps\": " << realized_insert_arrival_vecps << ",\n"
        << "  \"query_count\": " << query_count
        << ",\n  \"initial_rows\": " << initial_rows << ",\n  \"final_rows\": " << final_rows
        << ",\n  \"dynamic_insert_vectors\": " << (final_rows - initial_rows)
@@ -308,7 +356,36 @@ void WriteOutputs(const std::string& summary_path,
        << ",\n  \"max_latency_ms\": "
        << (all_latencies.empty() ? 0.0 : *std::max_element(all_latencies.begin(), all_latencies.end()))
        << ",\n  \"recall_at_k\": " << (queries.empty() ? 0.0 : recall_sum / queries.size())
-       << ",\n  \"total_time_ms\": " << total_ms << ",\n  \"active_lists\": "
+       << ",\n  \"streaming_workload_start_ms\": " << streaming_workload_start_ms
+       << ",\n  \"streaming_workload_end_ms\": " << streaming_workload_end_ms
+       << ",\n  \"streaming_workload_duration_ms\": " << total_ms
+       << ",\n  \"maintenance_drain_start_ms\": " << maintenance_drain_start_ms
+       << ",\n  \"maintenance_drain_end_ms\": " << maintenance_drain_end_ms
+       << ",\n  \"residual_maintenance_drain_ms\": " << maintenance_drain_ms
+       << ",\n  \"total_time_ms\": " << total_ms
+       << ",\n  \"maintenance_jobs_enqueued\": "
+       << final_maintenance_stats.jobs_enqueued
+       << ",\n  \"maintenance_jobs_started\": "
+       << final_maintenance_stats.jobs_started
+       << ",\n  \"maintenance_jobs_completed\": "
+       << final_maintenance_stats.jobs_completed
+       << ",\n  \"maintenance_jobs_retried\": "
+       << final_maintenance_stats.jobs_retried
+       << ",\n  \"maintenance_pending_after_drain\": "
+       << final_maintenance_stats.pending_jobs
+       << ",\n  \"maintenance_running_after_drain\": "
+       << final_maintenance_stats.running_jobs
+       << ",\n  \"maintenance_peak_pending_jobs\": "
+       << final_maintenance_stats.peak_pending_jobs
+       << ",\n  \"maintenance_pending_at_stream_end\": "
+       << stats_at_stream_end.pending_jobs
+       << ",\n  \"maintenance_running_at_stream_end\": "
+       << stats_at_stream_end.running_jobs
+       << ",\n  \"maintenance_queue_wait_ms\": "
+       << final_maintenance_stats.total_queue_wait_ms
+       << ",\n  \"maintenance_execution_ms\": "
+       << final_maintenance_stats.total_execution_ms
+       << ",\n  \"active_lists\": "
        << index.active_nlist() << ",\n  \"split_count\": " << index.split_count()
        << ",\n  \"reassign_scanned\": " << index.reassign_scanned()
        << ",\n  \"reassign_moved\": " << index.reassign_moved()
@@ -326,8 +403,12 @@ int main(int argc, char** argv) {
   try {
     std::vector<std::string> positional;
     uint64_t max_insert_vectors = std::numeric_limits<uint64_t>::max();
+    uint64_t max_maintenance_backlog = 0;
+    uint32_t update_thread_budget = 2;
+    double insert_rate_limit = 0.0;
     uint32_t query_threads = 0, insert_threads = 0, maintenance_threads = 0;
     bool cap_seen = false;
+    bool update_budget_seen = false;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       auto parse_option = [&](uint32_t* out, const std::string& name) {
@@ -341,6 +422,17 @@ int main(int argc, char** argv) {
         if (cap_seen || i + 1 >= argc) throw std::runtime_error("--max-insert-vectors requires one value");
         max_insert_vectors = ParseUint64(argv[++i], arg);
         cap_seen = true;
+      } else if (arg == "--insert-rate-limit") {
+        if (i + 1 >= argc) throw std::runtime_error("--insert-rate-limit requires one value");
+        insert_rate_limit = ParsePositiveDouble(argv[++i], arg);
+      } else if (arg == "--max-maintenance-backlog") {
+        if (i + 1 >= argc) throw std::runtime_error("--max-maintenance-backlog requires one value");
+        max_maintenance_backlog = ParseUint64(argv[++i], arg);
+        if (max_maintenance_backlog == 0)
+          throw std::runtime_error("--max-maintenance-backlog must be > 0");
+      } else if (arg == "--update-thread-budget") {
+        parse_option(&update_thread_budget, arg);
+        update_budget_seen = true;
       } else if (arg == "--query-threads") parse_option(&query_threads, arg);
       else if (arg == "--insert-threads") parse_option(&insert_threads, arg);
       else if (arg == "--maintenance-threads") parse_option(&maintenance_threads, arg);
@@ -348,13 +440,8 @@ int main(int argc, char** argv) {
       else positional.push_back(arg);
     }
     if (positional.size() < 3 || positional.size() > 4) {
-      std::cerr << "Usage: faiss_lire_concurrent_eval <config.json> <dataset_dir_or_base.fvecs> <disp_gt> [summary.json] [--max-insert-vectors N] [--query-threads N] [--insert-threads N] [--maintenance-threads N]\n";
+      std::cerr << "Usage: faiss_lire_concurrent_eval <config.json> <dataset_dir_or_base.fvecs> <disp_gt> [summary.json] [--max-insert-vectors N] [--query-threads N] [--insert-threads N] [--maintenance-threads N] [--update-thread-budget N] [--max-maintenance-backlog N] [--insert-rate-limit VECTORS_PER_SEC]\n";
       return 2;
-    }
-    if (maintenance_threads > 1) {
-      throw std::runtime_error(
-          "the first concurrent LIRE version requires --maintenance-threads 1; "
-          "multi-worker snapshot validation is not implemented yet");
     }
     const std::string config_path = positional[0];
     Config cfg = LoadConfigJson(config_path);
@@ -399,6 +486,18 @@ int main(int argc, char** argv) {
     lire.max_splits_per_batch = cfg.lire_max_splits_per_batch;
     lire.maintenance_threads = maintenance_threads ? maintenance_threads : 1;
     lire.insert_threads = insert_threads ? insert_threads : 1;
+    const uint64_t actual_update_threads =
+        static_cast<uint64_t>(lire.insert_threads) + lire.maintenance_threads;
+    if (actual_update_threads > update_thread_budget) {
+      throw std::runtime_error(
+          "insert_threads + maintenance_threads exceeds --update-thread-budget " +
+          std::to_string(update_thread_budget) +
+          (update_budget_seen ? "" : " (default is 2; specify the shared budget explicitly)"));
+    }
+    if (max_maintenance_backlog == 0) {
+      max_maintenance_backlog = std::max<uint64_t>(
+          1, static_cast<uint64_t>(lire.maintenance_threads) * 2);
+    }
     lire.async_maintenance = true;
     lire.enable_reassign = cfg.lire_enable_reassign;
     lire.validate_invariants = cfg.lire_validate_invariants;
@@ -420,12 +519,14 @@ int main(int argc, char** argv) {
     index.add_with_ids(initial_rows, RowPtr(base, 0), initial_ids.data());
     index.start_maintenance_workers();
     index.wait_for_maintenance();
+    if (lire.validate_invariants) index.validate_consistency();
     index.reset_maintenance_timeline();
     std::cout << "[INITIAL_INSERT] complete published_rows="
               << index.published_rows() << std::endl;
 
     const uint32_t qthreads = query_threads ? query_threads : 1;
     std::atomic<bool> stop_queries{false};
+    std::atomic<bool> start_queries{false};
     std::atomic<uint32_t> next_query{0};
     std::mutex records_mutex;
     std::mutex progress_mutex;
@@ -435,17 +536,31 @@ int main(int argc, char** argv) {
     std::vector<QueryRecord> query_records;
     std::vector<std::thread> workers;
     QueryWorkerJoiner joiner{stop_queries, workers};
-    const auto run_start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point run_start;
     auto elapsed_ms = [&] {
       return std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - run_start).count();
     };
+    run_start = std::chrono::steady_clock::now();
+    const double streaming_workload_start_ms = elapsed_ms();
+    std::cout << "[WORKLOAD] start elapsed_ms=" << streaming_workload_start_ms
+              << " query_workers=" << qthreads
+              << " query_threads_per_request=1"
+              << " insert_threads=" << lire.insert_threads
+              << " maintenance_threads=" << lire.maintenance_threads
+              << " update_thread_budget=" << update_thread_budget
+              << " max_maintenance_backlog=" << max_maintenance_backlog
+              << " insert_rate_limit_vecps=" << insert_rate_limit << std::endl;
     for (uint32_t worker = 0; worker < qthreads; ++worker) {
       workers.emplace_back([&, worker] {
         (void)worker;
         try {
           std::vector<float> distances(cfg.topk);
           std::vector<faiss::idx_t> labels(cfg.topk);
+          while (!start_queries.load(std::memory_order_acquire) &&
+                 !stop_queries.load(std::memory_order_relaxed)) {
+            std::this_thread::yield();
+          }
           while (!stop_queries.load(std::memory_order_relaxed)) {
             const uint32_t qi = next_query.fetch_add(1, std::memory_order_relaxed) % query.n;
             const uint32_t frontier = static_cast<uint32_t>(index.published_rows());
@@ -487,6 +602,7 @@ int main(int argc, char** argv) {
         }
       });
     }
+    start_queries.store(true, std::memory_order_release);
 
     std::vector<InsertRecord> insert_records;
     const uint32_t first_batch_end = final_rows > initial_rows ?
@@ -500,8 +616,28 @@ int main(int argc, char** argv) {
               << cfg.snapshot_interval << " batches=" << total_batches
               << " query_workers=" << qthreads << " insert_threads="
               << lire.insert_threads << " maintenance_threads="
-              << lire.maintenance_threads << std::endl;
+              << lire.maintenance_threads << " update_thread_budget="
+              << update_thread_budget << " max_maintenance_backlog="
+              << max_maintenance_backlog << " insert_rate_limit_vecps="
+              << insert_rate_limit << std::endl;
+    auto next_deadline = run_start;
+    bool first_batch = true;
     for (uint32_t begin = initial_rows; begin < final_rows;) {
+      const bool backpressured =
+          index.wait_for_maintenance_backlog(max_maintenance_backlog);
+      if (backpressured) {
+        std::cout << "[BACKPRESSURE] pending maintenance jobs exceed "
+                  << max_maintenance_backlog << "; delaying next batch" << std::endl;
+        next_deadline = std::chrono::steady_clock::now();
+      }
+      if (insert_rate_limit > 0.0 && !first_batch) {
+        const double period_seconds = static_cast<double>(cfg.snapshot_interval) /
+            insert_rate_limit;
+        next_deadline += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(period_seconds));
+        std::this_thread::sleep_until(next_deadline);
+      }
+      first_batch = false;
       const uint32_t end = static_cast<uint32_t>(std::min<uint64_t>(final_rows,
           static_cast<uint64_t>(begin) + cfg.snapshot_interval));
       InsertRecord record;
@@ -519,6 +655,12 @@ int main(int argc, char** argv) {
       record.throughput = record.latency_ms > 0.0 ?
           (end - begin) * 1000.0 / record.latency_ms : 0.0;
       insert_records.push_back(record);
+      const LireMaintenanceStats batch_maintenance = index.maintenance_stats();
+      insert_records.back().maintenance_pending_jobs = batch_maintenance.pending_jobs;
+      insert_records.back().maintenance_running_jobs = batch_maintenance.running_jobs;
+      insert_records.back().maintenance_completed_jobs = batch_maintenance.jobs_completed;
+      insert_records.back().maintenance_peak_pending_jobs = batch_maintenance.peak_pending_jobs;
+      insert_records.back().maintenance_stale_retries = batch_maintenance.jobs_retried;
       std::cout << "[INSERT_PROGRESS] batch=" << (record.batch + 1) << "/"
                 << total_batches << " rows=[" << begin << "," << end
                 << ") insert_ms=" << record.latency_ms
@@ -526,31 +668,53 @@ int main(int argc, char** argv) {
                 << " published_rows=" << index.published_rows()
                 << " queries_completed="
                 << completed_queries.load(std::memory_order_relaxed)
+                << " maintenance_queued=" << batch_maintenance.jobs_enqueued
+                << " maintenance_running=" << batch_maintenance.running_jobs
+                << " maintenance_completed=" << batch_maintenance.jobs_completed
+                << " maintenance_pending=" << batch_maintenance.pending_jobs
+                << " maintenance_peak_pending=" << batch_maintenance.peak_pending_jobs
+                << " maintenance_stale_retries=" << batch_maintenance.jobs_retried
                 << std::endl;
       begin = end;
     }
-    std::cout << "[MAINTENANCE] waiting for queued jobs" << std::endl;
-    try {
-      index.wait_for_maintenance();
-    } catch (...) {
-      stop_queries.store(true, std::memory_order_relaxed);
-      for (auto& worker : workers) if (worker.joinable()) worker.join();
-      throw;
-    }
-    std::cout << "[MAINTENANCE] all queued jobs complete" << std::endl;
+    std::cout << "[WORKLOAD] dynamic inserts complete published_rows="
+              << index.published_rows() << std::endl;
+    std::cout << "[QUERY] stopping admission" << std::endl;
     stop_queries.store(true, std::memory_order_relaxed);
     for (auto& worker : workers) if (worker.joinable()) worker.join();
-    const double total_ms = elapsed_ms();
+    const double streaming_workload_end_ms = elapsed_ms();
+    const LireMaintenanceStats stats_at_stream_end = index.maintenance_stats();
+    std::cout << "[QUERY] workers joined completed=" << query_records.size()
+              << " streaming_end_ms=" << streaming_workload_end_ms << std::endl;
+    std::cout << "[WORKLOAD] streaming phase complete pending_jobs="
+              << stats_at_stream_end.pending_jobs << " running_jobs="
+              << stats_at_stream_end.running_jobs << std::endl;
+    const double maintenance_drain_start_ms = elapsed_ms();
+    std::cout << "[MAINTENANCE] residual drain start elapsed_ms="
+              << maintenance_drain_start_ms << std::endl;
+    index.wait_for_maintenance();
+    const double maintenance_drain_end_ms = elapsed_ms();
+    std::cout << "[MAINTENANCE] residual drain complete elapsed_ms="
+              << maintenance_drain_end_ms << std::endl;
+    if (index.published_rows() != static_cast<faiss::idx_t>(final_rows)) {
+      throw std::runtime_error("published_rows does not match final_rows after streaming workload");
+    }
+    if (lire.validate_invariants) index.validate_consistency();
     {
       std::lock_guard<std::mutex> lock(error_mutex);
       if (query_error) std::rethrow_exception(query_error);
     }
     index.stop_maintenance_workers();
+    const LireMaintenanceStats final_maintenance_stats = index.maintenance_stats();
     WriteOutputs(summary_path, config_path, base_path, query_path, gt_path,
         cfg.topk, qthreads, lire.insert_threads, lire.maintenance_threads,
+        update_thread_budget, max_maintenance_backlog, insert_rate_limit,
         initial_rows, final_rows, first_batch_end, cap_seen,
         max_insert_vectors, query.n,
-        query_records, insert_records, index.maintenance_events(), index, total_ms);
+        query_records, insert_records, index.maintenance_events(), index,
+        streaming_workload_start_ms, streaming_workload_end_ms,
+        maintenance_drain_start_ms, maintenance_drain_end_ms,
+        stats_at_stream_end, final_maintenance_stats);
     std::cout << "Concurrent LIRE run completed: rows=" << final_rows
               << " queries=" << query_records.size() << " summary=" << summary_path << '\n';
     return 0;
