@@ -148,12 +148,11 @@ void WriteOutputs(const std::string& summary_path,
                   const std::string& gt_path,
                   uint32_t topk,
                   uint32_t query_workers,
-                  uint32_t insert_workers,
+                  uint32_t insert_threads,
                   uint32_t maintenance_workers,
                   uint32_t initial_rows,
                   uint32_t final_rows,
                   uint32_t first_batch_end,
-                  const std::vector<uint32_t>& expected_frontiers,
                   bool insert_cap_enabled,
                   uint64_t max_insert_vectors,
                   uint32_t query_count,
@@ -195,43 +194,64 @@ void WriteOutputs(const std::string& summary_path,
               << event.reassigned_vectors << '\n';
   }
 
-  std::map<uint32_t, std::vector<const QueryRecord*>> by_frontier;
-  for (const auto& record : queries) by_frontier[record.frontier].push_back(&record);
   std::ofstream progress_csv(progress_path);
-  progress_csv << "dynamic_insert_progress_pct,frontier_rows,query_count,qps,mean_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,max_latency_ms,recall_at_k\n";
+  progress_csv << "batch,dynamic_insert_progress_pct,begin_row,end_row,batch_start_ms,batch_end_ms,query_count,qps,recall_at_k,mean_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,max_latency_ms,insert_latency_ms,insert_throughput_vecps\n";
   std::ofstream timeseries_csv(timeseries_path);
   timeseries_csv << "time_ms,dynamic_insert_progress_pct,frontier_rows,query_count,qps,mean_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,max_latency_ms,recall_at_k\n";
 
   std::map<uint64_t, std::vector<const QueryRecord*>> by_time;
   for (const auto& record : queries)
     by_time[static_cast<uint64_t>(record.completion_ms / 200.0)].push_back(&record);
-  for (uint32_t frontier : expected_frontiers) {
-    const auto found = by_frontier.find(frontier);
-    const std::vector<const QueryRecord*> empty;
-    const auto& group = found == by_frontier.end() ? empty : found->second;
-    // Progress CSV field order is stable and independent of the time-series schema.
+  std::vector<double> insert_progress(inserts.size(), 100.0);
+  if (inserts.size() > 1) {
+    const double first_end_row = inserts.front().end_row;
+    const double last_end_row = inserts.back().end_row;
+    const double row_span = last_end_row - first_end_row;
+    if (row_span > 0.0) {
+      for (size_t i = 0; i < inserts.size(); ++i) {
+        insert_progress[i] =
+            (static_cast<double>(inserts[i].end_row) - first_end_row) /
+            row_span * 100.0;
+      }
+    }
+  }
+  for (size_t batch_index = 0; batch_index < inserts.size(); ++batch_index) {
+    const InsertRecord& batch = inserts[batch_index];
     std::vector<double> latencies;
     double recall = 0.0;
-    for (const QueryRecord* record : group) {
-      latencies.push_back(record->latency_ms);
-      recall += record->recall;
+    for (const QueryRecord& record : queries) {
+      if (record.completion_ms >= batch.start_ms &&
+          record.completion_ms <= batch.end_ms) {
+        latencies.push_back(record.latency_ms);
+        recall += record.recall;
+      }
     }
-    const double mean = latencies.empty() ? 0.0 :
+    const double mean = latencies.empty() ? std::numeric_limits<double>::quiet_NaN() :
         std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
-    double window_begin = 0.0;
-    double window_end = total_ms;
-    for (const auto& insert : inserts) {
-      if (insert.end_row <= frontier) window_begin = insert.end_ms;
-      else { window_end = insert.end_ms; break; }
-    }
-    const double qps = latencies.size() /
-        std::max(0.001, (window_end - window_begin) / 1000.0);
-    progress_csv << ProgressForFrontier(frontier, initial_rows, final_rows, first_batch_end)
-                 << ',' << frontier << ',' << latencies.size() << ',' << qps << ',' << mean
-                 << ',' << Percentile(latencies, .50) << ',' << Percentile(latencies, .95)
-                 << ',' << Percentile(latencies, .99) << ','
-                 << (latencies.empty() ? 0.0 : *std::max_element(latencies.begin(), latencies.end()))
-                 << ',' << (group.empty() ? 0.0 : recall / group.size()) << '\n';
+    const double duration_seconds = (batch.end_ms - batch.start_ms) / 1000.0;
+    const double qps = duration_seconds > 0.0 ? latencies.size() / duration_seconds : 0.0;
+    const double recall_mean = latencies.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : recall / latencies.size();
+    const double latency_max = latencies.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : *std::max_element(latencies.begin(), latencies.end());
+    progress_csv << batch.batch << ',' << insert_progress[batch_index] << ','
+                 << batch.begin_row << ',' << batch.end_row << ','
+                 << batch.start_ms << ',' << batch.end_ms << ','
+                 << latencies.size() << ',' << qps << ',';
+    if (std::isfinite(recall_mean)) progress_csv << recall_mean;
+    progress_csv << ',';
+    if (std::isfinite(mean)) progress_csv << mean;
+    progress_csv << ',';
+    if (!latencies.empty()) progress_csv << Percentile(latencies, .50);
+    progress_csv << ',';
+    if (!latencies.empty()) progress_csv << Percentile(latencies, .95);
+    progress_csv << ',';
+    if (!latencies.empty()) progress_csv << Percentile(latencies, .99);
+    progress_csv << ',';
+    if (std::isfinite(latency_max)) progress_csv << latency_max;
+    progress_csv << ',' << batch.latency_ms << ',' << batch.throughput << '\n';
   }
   for (const auto& [bucket, group] : by_time) {
     uint32_t frontier = initial_rows;
@@ -271,7 +291,7 @@ void WriteOutputs(const std::string& summary_path,
        << "  \"gt_artifact\": \"" << JsonEscape(gt_path) << "\",\n"
        << "  \"topk\": " << topk << ",\n"
        << "  \"query_workers\": " << query_workers << ",\n"
-       << "  \"insert_workers\": " << insert_workers << ",\n"
+       << "  \"insert_threads\": " << insert_threads << ",\n"
        << "  \"maintenance_workers\": " << maintenance_workers << ",\n"
        << "  \"query_count\": " << query_count
        << ",\n  \"initial_rows\": " << initial_rows << ",\n  \"final_rows\": " << final_rows
@@ -330,6 +350,11 @@ int main(int argc, char** argv) {
     if (positional.size() < 3 || positional.size() > 4) {
       std::cerr << "Usage: faiss_lire_concurrent_eval <config.json> <dataset_dir_or_base.fvecs> <disp_gt> [summary.json] [--max-insert-vectors N] [--query-threads N] [--insert-threads N] [--maintenance-threads N]\n";
       return 2;
+    }
+    if (maintenance_threads > 1) {
+      throw std::runtime_error(
+          "the first concurrent LIRE version requires --maintenance-threads 1; "
+          "multi-worker snapshot validation is not implemented yet");
     }
     const std::string config_path = positional[0];
     Config cfg = LoadConfigJson(config_path);
@@ -482,7 +507,7 @@ int main(int argc, char** argv) {
     index.stop_maintenance_workers();
     WriteOutputs(summary_path, config_path, base_path, query_path, gt_path,
         cfg.topk, qthreads, lire.insert_threads, lire.maintenance_threads,
-        initial_rows, final_rows, first_batch_end, frontiers, cap_seen,
+        initial_rows, final_rows, first_batch_end, cap_seen,
         max_insert_vectors, query.n,
         query_records, insert_records, index.maintenance_events(), index, total_ms);
     std::cout << "Concurrent LIRE run completed: rows=" << final_rows

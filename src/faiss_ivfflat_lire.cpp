@@ -131,6 +131,10 @@ IndexIVFFlatLIRE::IndexIVFFlatLIRE(int d, const LireConfig& config)
       config_.split_threshold < 2) {
     throw std::runtime_error("invalid IndexIVFFlatLIRE configuration");
   }
+  if (config_.async_maintenance && config_.maintenance_threads != 1) {
+    throw std::runtime_error(
+        "async IndexIVFFlatLIRE currently requires exactly one maintenance worker");
+  }
   own_fields = true;
   is_trained = false;
   list_mutexes_.reserve(max_nlist_);
@@ -643,6 +647,10 @@ uint64_t IndexIVFFlatLIRE::apply_moves(const std::vector<Move>& moves) {
     if (!lists.count(move.target)) lists.emplace(move.target, ListData{});
     target_by_id.emplace(move.id, move.target);
   }
+  // Conservative first-version publication: the global state lock protects
+  // membership/list consistency while affected lists are materialized and
+  // rewritten. This can block query routing during reassignment commit and is
+  // a later tuning point.
   std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
   std::vector<faiss::idx_t> slots;
   slots.reserve(lists.size());
