@@ -89,7 +89,12 @@ struct LireMaintenanceStats {
   uint64_t reassign_jobs_dropped_stale{0};
   uint64_t reassign_jobs_noop_same_target{0};
   uint64_t reassign_vectors_moved{0};
+  uint64_t query_stale_copies_skipped{0};
+  uint64_t maintenance_stale_copies_filtered{0};
+  // Compatibility aggregate: query + maintenance filter occurrences.
   uint64_t stale_physical_copies_filtered{0};
+  uint64_t reassign_source_rescans{0};
+  uint64_t reassign_payload_bytes_enqueued{0};
 };
 
 struct LireOversizedListStats {
@@ -156,6 +161,7 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
     faiss::idx_t triggering_list{-1};
     faiss::idx_t vector_id{-1};
     faiss::idx_t previous_slot{-1};
+    std::vector<float> vector_payload;
     double request_ms{0.0};
   };
 
@@ -222,7 +228,10 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
   uint64_t split_count_{0};
   std::atomic<uint64_t> reassign_scanned_{0};
   std::atomic<uint64_t> reassign_moved_{0};
-  mutable std::atomic<uint64_t> stale_physical_copies_filtered_{0};
+  mutable std::atomic<uint64_t> query_stale_copies_skipped_{0};
+  mutable std::atomic<uint64_t> maintenance_stale_copies_filtered_{0};
+  // Diagnostic counter; the payload-based ReassignJob path never increments it.
+  std::atomic<uint64_t> reassign_source_rescans_{0};
   std::vector<std::unique_ptr<std::shared_mutex>> list_mutexes_;
   std::atomic<faiss::idx_t> published_rows_{0};
   mutable std::mutex insert_mutex_;
@@ -256,6 +265,7 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
   uint64_t reassign_jobs_dropped_stale_{0};
   uint64_t reassign_jobs_noop_same_target_{0};
   uint64_t reassign_vectors_moved_{0};
+  uint64_t reassign_payload_bytes_enqueued_{0};
   std::exception_ptr maintenance_error_;
   mutable std::mutex maintenance_events_mutex_;
   std::vector<LireMaintenanceEvent> maintenance_events_;

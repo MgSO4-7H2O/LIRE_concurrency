@@ -621,7 +621,7 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
     // below the split trigger.
     write_list(slot, input);
     note_oversized_list_state(slot, true, input.size());
-    stale_physical_copies_filtered_.fetch_add(
+    maintenance_stale_copies_filtered_.fetch_add(
         *stale_copies_filtered, std::memory_order_relaxed);
     return {slot};
   }
@@ -629,7 +629,7 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
   std::vector<uint8_t> labels;
   std::vector<float> new_centers;
   if (!split_balanced_kmeans(input, &labels, &new_centers)) {
-    stale_physical_copies_filtered_.fetch_add(
+    maintenance_stale_copies_filtered_.fetch_add(
         *stale_copies_filtered, std::memory_order_relaxed);
     return {};
   }
@@ -654,7 +654,7 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
     std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
     if (!active_[static_cast<size_t>(slot)] ||
         active_[static_cast<size_t>(new_slot)]) {
-      stale_physical_copies_filtered_.fetch_add(
+      maintenance_stale_copies_filtered_.fetch_add(
           *stale_copies_filtered, std::memory_order_relaxed);
       return {};
     }
@@ -683,7 +683,7 @@ std::vector<faiss::idx_t> IndexIVFFlatLIRE::split_one(
     collect_and_reassign(
         old_center, slot, new_slot, stale_copies_filtered);
   }
-  stale_physical_copies_filtered_.fetch_add(
+  maintenance_stale_copies_filtered_.fetch_add(
       *stale_copies_filtered, std::memory_order_relaxed);
   return changed;
 }
@@ -755,6 +755,9 @@ void IndexIVFFlatLIRE::collect_and_reassign(
       job.triggering_list = list;
       job.vector_id = id;
       job.previous_slot = list;
+      // This evaluator is insert-only: vector contents never change in place,
+      // so the captured payload remains valid while the asynchronous job waits.
+      job.vector_payload.assign(vector, vector + d);
       enqueue_reassign(std::move(job));
     }
   };
@@ -782,29 +785,20 @@ bool IndexIVFFlatLIRE::run_reassign(
     return false;
   }
 
-  // The current authoritative vector is still present in its membership
-  // posting. Read it there instead of copying every candidate into the queue.
-  std::vector<float> vector(static_cast<size_t>(d));
+  if (job.vector_payload.size() != static_cast<size_t>(d))
+    throw std::runtime_error("LIRE reassignment payload dimension mismatch");
+
+  // Membership is the authoritative logical location. A stale job is dropped
+  // here without searching its old posting or repeating candidate discovery.
   {
-    std::shared_lock<std::shared_mutex> source_lock(list_mutex(job.previous_slot));
     std::shared_lock<std::shared_mutex> membership_lock(membership_mutex_);
     if (static_cast<size_t>(job.vector_id) >= membership_.size() ||
         membership_[static_cast<size_t>(job.vector_id)] != job.previous_slot) {
       *dropped_stale = true;
       return false;
     }
-    const ListData source = read_list(job.previous_slot);
-    bool found = false;
-    for (size_t i = 0; i < source.size(); ++i) {
-      if (source.ids[i] != job.vector_id) continue;
-      std::copy(source.row(i, d), source.row(i, d) + d, vector.begin());
-      found = true;
-      break;
-    }
-    if (!found)
-      throw std::runtime_error(
-          "LIRE authoritative membership has no physical vector copy");
   }
+  const float* vector = job.vector_payload.data();
 
   for (;;) {
     faiss::idx_t target = -1;
@@ -815,7 +809,7 @@ bool IndexIVFFlatLIRE::run_reassign(
         *dropped_stale = true;
         return false;
       }
-      target = nearest_active(vector.data());
+      target = nearest_active(vector);
       route_generation = topology_generation_;
     }
     if (target < 0) {
@@ -826,7 +820,7 @@ bool IndexIVFFlatLIRE::run_reassign(
     if (target == job.previous_slot) {
       std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
       if (route_generation != topology_generation_ ||
-          nearest_active(vector.data()) != target) continue;
+          nearest_active(vector) != target) continue;
       std::shared_lock<std::shared_mutex> membership_lock(membership_mutex_);
       if (static_cast<size_t>(job.vector_id) >= membership_.size() ||
           membership_[static_cast<size_t>(job.vector_id)] != job.previous_slot) {
@@ -848,7 +842,7 @@ bool IndexIVFFlatLIRE::run_reassign(
     if (route_generation != topology_generation_) continue;
     if (!active_[static_cast<size_t>(job.previous_slot)] ||
         !active_[static_cast<size_t>(target)] ||
-        nearest_active(vector.data()) != target) continue;
+        nearest_active(vector) != target) continue;
 
     std::unique_lock<std::shared_mutex> membership_lock(membership_mutex_);
     if (static_cast<size_t>(job.vector_id) >= membership_.size() ||
@@ -875,7 +869,7 @@ bool IndexIVFFlatLIRE::run_reassign(
       const faiss::idx_t id = job.vector_id;
       invlists->add_entries(
           static_cast<size_t>(target), 1, &id,
-          reinterpret_cast<const uint8_t*>(vector.data()));
+          reinterpret_cast<const uint8_t*>(vector));
     }
     membership_[static_cast<size_t>(job.vector_id)] = target;
     note_oversized_list_state(
@@ -946,6 +940,8 @@ void IndexIVFFlatLIRE::enqueue_job(MaintenanceJob job) {
     ++split_jobs_enqueued_;
   } else {
     ++reassign_jobs_enqueued_;
+    reassign_payload_bytes_enqueued_ +=
+        job.vector_payload.size() * sizeof(float);
   }
   ++maintenance_jobs_enqueued_;
   maintenance_queue_.push_back(std::move(job));
@@ -1183,8 +1179,16 @@ LireMaintenanceStats IndexIVFFlatLIRE::maintenance_stats() const {
   stats.reassign_jobs_dropped_stale = reassign_jobs_dropped_stale_;
   stats.reassign_jobs_noop_same_target = reassign_jobs_noop_same_target_;
   stats.reassign_vectors_moved = reassign_vectors_moved_;
+  stats.query_stale_copies_skipped =
+      query_stale_copies_skipped_.load(std::memory_order_relaxed);
+  stats.maintenance_stale_copies_filtered =
+      maintenance_stale_copies_filtered_.load(std::memory_order_relaxed);
   stats.stale_physical_copies_filtered =
-      stale_physical_copies_filtered_.load(std::memory_order_relaxed);
+      stats.query_stale_copies_skipped +
+      stats.maintenance_stale_copies_filtered;
+  stats.reassign_source_rescans =
+      reassign_source_rescans_.load(std::memory_order_relaxed);
+  stats.reassign_payload_bytes_enqueued = reassign_payload_bytes_enqueued_;
   return stats;
 }
 
@@ -1251,9 +1255,12 @@ void IndexIVFFlatLIRE::reset_maintenance_timeline() {
     reassign_jobs_dropped_stale_ = 0;
     reassign_jobs_noop_same_target_ = 0;
     reassign_vectors_moved_ = 0;
+    reassign_payload_bytes_enqueued_ = 0;
     maintenance_last_log_ = maintenance_epoch_;
   }
-  stale_physical_copies_filtered_.store(0, std::memory_order_relaxed);
+  query_stale_copies_skipped_.store(0, std::memory_order_relaxed);
+  maintenance_stale_copies_filtered_.store(0, std::memory_order_relaxed);
+  reassign_source_rescans_.store(0, std::memory_order_relaxed);
   std::lock_guard<std::mutex> lock(maintenance_events_mutex_);
   maintenance_events_.clear();
 }
@@ -1499,7 +1506,7 @@ void IndexIVFFlatLIRE::search_at_frontier(
           if (id < 0 || id >= visible_rows) continue;
           if (static_cast<size_t>(id) >= membership_.size() ||
               membership_[static_cast<size_t>(id)] != slot) {
-            stale_physical_copies_filtered_.fetch_add(
+            query_stale_copies_skipped_.fetch_add(
                 1, std::memory_order_relaxed);
             continue;
           }

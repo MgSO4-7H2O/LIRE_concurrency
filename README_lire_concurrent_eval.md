@@ -84,11 +84,13 @@ per-vector reassignment use the same order, avoiding a state/list ABBA cycle.
 
 After publication, candidate discovery scans the two children and up to
 `lire_reassign_k` nearby lists. It only submits individual ReassignJobs; its
-snapshot is not a commit transaction. Jobs carry an ID and previous list, not
-a second vector payload. At execution, each job checks the vector's current
-membership and reads its data from that authoritative posting. It routes again
-against current active centroids, locks the previous and target postings in
-ascending order, appends the physical target copy, and then updates the
+snapshot is not a commit transaction. ReassignJob carries the candidate vector
+payload captured during CollectReAssign, following the behavior observed in
+SPFresh's ReassignAsync path. Vector contents are immutable in this insert-only
+evaluator, so a job validates logical membership and routes the captured
+payload against current active centroids without rescanning the old posting to
+recover the vector. It locks the previous and target postings in ascending
+order, appends the physical target copy if needed, and then updates the
 authoritative `membership[id]`. A job whose previous membership has changed is
 dropped cheaply. Existing obsolete copies can remain in old postings; Query
 filters a copy unless `membership[id]` equals the scanned list, and later
@@ -106,7 +108,12 @@ adding unbudgeted workers. `topology_generation_` is used only to refresh a
 vector's routing decision if topology changes while it waits for posting
 locks; it does not invalidate or restart neighborhood discovery. The summary
 and insert CSV expose split/reassign job counts, stale job drops, successful
-moves, and stale physical copies filtered. Query routing validates its
+moves, `query_stale_copies_skipped`, and
+`maintenance_stale_copies_filtered`. These are filter occurrences, not unique
+physical-copy counts. The compatibility field `stale_physical_copies_filtered`
+is their sum. `reassign_source_rescans` is expected to remain zero, while
+`reassign_payload_bytes_enqueued` reports the cumulative vector payload bytes
+stored in accepted ReassignJobs. Query routing validates its
 topology snapshot after acquiring the selected posting locks; it reroutes if a
 split published in the gap, so it never scans an old route set against newly
 published split postings.
