@@ -222,7 +222,7 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
   uint64_t split_count_{0};
   std::atomic<uint64_t> reassign_scanned_{0};
   std::atomic<uint64_t> reassign_moved_{0};
-  std::atomic<uint64_t> stale_physical_copies_filtered_{0};
+  mutable std::atomic<uint64_t> stale_physical_copies_filtered_{0};
   std::vector<std::unique_ptr<std::shared_mutex>> list_mutexes_;
   std::atomic<faiss::idx_t> published_rows_{0};
   mutable std::mutex insert_mutex_;
