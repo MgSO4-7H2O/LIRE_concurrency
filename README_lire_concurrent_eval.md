@@ -9,10 +9,64 @@ in-flight queries. It records the streaming workload end at that point, then
 drains residual maintenance separately. That residual drain is excluded from
 query count, QPS, latency, recall, progress, and streaming workload duration.
 
-Example:
+The SIFT1M workflow uses an independent Raw-L2 exact GT. Prepare it offline
+before starting the concurrent evaluator:
 
 ```bash
-./build/faiss_lire_concurrent_eval CONFIG.json DATASET_DIR DISP_GT.gt SUMMARY.json \
+mkdir -p artifacts result
+./build/faiss_lire_concurrent_eval --prepare-gt \
+  configs/sift_lire_concurrent_prepare.json \
+  /home/ydy/data/sift/origin \
+  artifacts/sift_lire_raw_l2.liregt
+```
+
+Then load that artifact for the concurrent query/insert/maintenance run:
+
+```bash
+./build/faiss_lire_concurrent_eval \
+  configs/sift_lire_concurrent_query.json \
+  /home/ydy/data/sift/origin \
+  artifacts/sift_lire_raw_l2.liregt \
+  result/sift1m_concurrent_lire_raw_l2.json \
+  --query-workers 8 \
+  --query-threads-per-request 3 \
+  --insert-threads 1 \
+  --maintenance-threads 6 \
+  --update-thread-budget 7 \
+  --insert-rate-limit 12000
+```
+
+`--prepare-gt` computes exact squared-L2 over the original float32 rows,
+`sum((q[i] - x[i])^2)`, with no whitening, normalization, PQ, or IVF search.
+For each query it scans only rows added since the previous frontier and
+maintains an exact top-k heap, snapshotting the ordered IDs at each frontier.
+OpenMP parallelizes independent queries during this offline phase. The
+`LIREGT01` artifact records the raw-L2 distance-space identifier, canonical
+base/query paths and content fingerprints, query count, dimension, top-k,
+initial rows, snapshot interval, configured final rows, the complete frontier
+sequence, per-frontier DocIds, and a payload checksum. The query evaluator only
+loads `LIREGT01`; it rejects DiSPQ GT files, mismatched metadata/data/frontiers,
+corrupt payloads, and trailing bytes without fallback.
+
+The prepare and query configs share `topk`, `main_index_rows`,
+`snapshot_interval`, and `final_rows`. Queries capture `published_rows()` once
+and compare their results only with the exact GT for that same frontier.
+Maintenance changes list organization but never advances the GT frontier.
+
+For a smaller run, `--max-insert-vectors` may be used if the resulting final
+frontier is present in the prepared artifact; an incompatible partial batch
+frontier is rejected.
+
+Build command:
+
+```bash
+cmake --build build -j
+```
+
+Existing general command shape:
+
+```bash
+./build/faiss_lire_concurrent_eval CONFIG.json DATASET_DIR LIRE_GT.liregt SUMMARY.json \
   --max-insert-vectors 30000 \
   --query-workers 8 \
   --query-threads-per-request 3 \

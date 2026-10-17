@@ -21,12 +21,28 @@ namespace {
 
 struct GroundTruth {
   std::vector<uint32_t> frontiers;
-  std::vector<std::vector<std::vector<uint32_t>>> ids;
+  uint32_t query_count{0};
+  uint32_t topk{0};
+  std::vector<uint32_t> ids;
+
+  const uint32_t* query_row(size_t version, uint32_t query_id) const {
+    return ids.data() +
+        (version * static_cast<size_t>(query_count) + query_id) * topk;
+  }
 };
 
 template <typename T>
 bool ReadNative(std::istream& in, T* value) {
   return static_cast<bool>(in.read(reinterpret_cast<char*>(value), sizeof(T)));
+}
+
+void WriteArtifactString(std::ostream& out, const std::string& value) {
+  if (value.size() > std::numeric_limits<uint32_t>::max())
+    throw std::runtime_error("GT identity string is too large");
+  const uint32_t size = static_cast<uint32_t>(value.size());
+  out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+  out.write(value.data(), static_cast<std::streamsize>(value.size()));
+  if (!out) throw std::runtime_error("Failed writing LIRE GT identity string");
 }
 
 std::string ReadArtifactString(std::istream& in) {
@@ -38,49 +54,230 @@ std::string ReadArtifactString(std::istream& in) {
   return value;
 }
 
+constexpr uint64_t kFnvOffset = 14695981039346656037ull;
+constexpr uint64_t kFnvPrime = 1099511628211ull;
+
+void HashBytes(uint64_t* hash, const void* data, size_t size) {
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    *hash ^= bytes[i];
+    *hash *= kFnvPrime;
+  }
+}
+
+uint64_t HashFloatPrefix(const FvecsData& data, uint32_t rows) {
+  if (rows > data.n) throw std::runtime_error("GT hash prefix exceeds dataset rows");
+  static_assert(sizeof(float) == sizeof(uint32_t), "LIRE raw GT expects float32");
+  uint64_t hash = kFnvOffset;
+  HashBytes(&hash, data.values.data(),
+            static_cast<size_t>(rows) * data.d * sizeof(float));
+  return hash;
+}
+
+std::string NormalizeIdentity(const std::string& path) {
+  std::error_code error;
+  const auto normalized = std::filesystem::weakly_canonical(path, error);
+  if (error) return std::filesystem::absolute(path).lexically_normal().string();
+  return normalized.string();
+}
+
+std::vector<uint32_t> BuildFrontiers(uint32_t initial_rows,
+                                     uint32_t final_rows,
+                                     uint32_t snapshot_interval) {
+  if (snapshot_interval == 0 || final_rows < initial_rows)
+    throw std::runtime_error("Invalid LIRE GT frontier configuration");
+  std::vector<uint32_t> frontiers{initial_rows};
+  for (uint64_t end = initial_rows; end < final_rows;) {
+    end = std::min<uint64_t>(final_rows, end + snapshot_interval);
+    frontiers.push_back(static_cast<uint32_t>(end));
+  }
+  return frontiers;
+}
+
+GroundTruth ComputeRawL2PrefixGroundTruth(const FvecsData& base,
+                                          const FvecsData& query,
+                                          uint32_t topk,
+                                          const std::vector<uint32_t>& frontiers,
+                                          uint32_t threads) {
+  if (frontiers.empty() || query.n == 0 || topk == 0 || threads == 0)
+    throw std::runtime_error("Invalid input for Raw-L2 GT computation");
+  GroundTruth gt;
+  gt.frontiers = frontiers;
+  gt.query_count = query.n;
+  gt.topk = topk;
+  gt.ids.resize(frontiers.size() * static_cast<size_t>(query.n) * topk);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(static_cast<int>(threads)) schedule(dynamic)
+#endif
+  for (int64_t qi64 = 0; qi64 < static_cast<int64_t>(query.n); ++qi64) {
+    const uint32_t qi = static_cast<uint32_t>(qi64);
+    const float* q = RowPtr(query, qi);
+    using Candidate = std::pair<double, uint32_t>;
+    std::priority_queue<Candidate> heap;
+    uint32_t scanned_rows = 0;
+    for (size_t version = 0; version < frontiers.size(); ++version) {
+      const uint32_t frontier = frontiers[version];
+      for (uint32_t row = scanned_rows; row < frontier; ++row) {
+        const float* x = RowPtr(base, row);
+        double distance = 0.0;
+        for (uint32_t dim = 0; dim < base.d; ++dim) {
+          const double diff = static_cast<double>(q[dim]) - x[dim];
+          distance += diff * diff;
+        }
+        const Candidate candidate{distance, row};
+        if (heap.size() < topk) {
+          heap.push(candidate);
+        } else if (candidate < heap.top()) {
+          heap.pop();
+          heap.push(candidate);
+        }
+      }
+      scanned_rows = frontier;
+      std::vector<Candidate> ordered(heap.size());
+      for (size_t i = ordered.size(); i > 0; --i) {
+        ordered[i - 1] = heap.top();
+        heap.pop();
+      }
+      std::sort(ordered.begin(), ordered.end());
+      uint32_t* ids = gt.ids.data() +
+          (version * static_cast<size_t>(query.n) + qi) * topk;
+      for (size_t i = 0; i < ordered.size(); ++i)
+        ids[i] = ordered[i].second;
+      for (const Candidate& candidate : ordered) heap.push(candidate);
+    }
+  }
+  return gt;
+}
+
+void SaveGroundTruth(const std::string& path,
+                     const std::string& base_identity,
+                     const std::string& query_identity,
+                     uint64_t base_hash,
+                     uint64_t query_hash,
+                     uint32_t query_count,
+                     uint32_t dimension,
+                     uint32_t topk,
+                     uint32_t initial_rows,
+                     uint32_t snapshot_interval,
+                     uint32_t final_rows,
+                     const GroundTruth& gt) {
+  const std::filesystem::path artifact_path(path);
+  if (!artifact_path.parent_path().empty()) {
+    std::error_code error;
+    std::filesystem::create_directories(artifact_path.parent_path(), error);
+    if (error)
+      throw std::runtime_error("Unable to create LIRE GT directory: " + error.message());
+  }
+  std::ofstream out(path, std::ios::binary);
+  if (!out) throw std::runtime_error("Unable to write LIRE GT artifact: " + path);
+  out.write("LIREGT01", 8);
+  const uint32_t format_version = 1;
+  out.write(reinterpret_cast<const char*>(&format_version), sizeof(format_version));
+  WriteArtifactString(out, "raw_l2_squared_float32");
+  WriteArtifactString(out, base_identity);
+  WriteArtifactString(out, query_identity);
+  out.write(reinterpret_cast<const char*>(&base_hash), sizeof(base_hash));
+  out.write(reinterpret_cast<const char*>(&query_hash), sizeof(query_hash));
+  const uint32_t frontier_count = static_cast<uint32_t>(gt.frontiers.size());
+  const uint32_t metadata[] = {query_count, dimension, topk, initial_rows,
+                               snapshot_interval, final_rows, frontier_count};
+  out.write(reinterpret_cast<const char*>(metadata), sizeof(metadata));
+  for (uint32_t frontier : gt.frontiers)
+    out.write(reinterpret_cast<const char*>(&frontier), sizeof(frontier));
+
+  uint64_t payload_hash = kFnvOffset;
+  const size_t expected_ids = gt.frontiers.size() *
+      static_cast<size_t>(query_count) * topk;
+  if (gt.query_count != query_count || gt.topk != topk ||
+      gt.ids.size() != expected_ids)
+    throw std::runtime_error("Internal LIRE GT payload shape mismatch");
+  const size_t payload_bytes = gt.ids.size() * sizeof(uint32_t);
+  out.write(reinterpret_cast<const char*>(gt.ids.data()),
+            static_cast<std::streamsize>(payload_bytes));
+  HashBytes(&payload_hash, gt.ids.data(), payload_bytes);
+  out.write(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+  out.flush();
+  if (!out) throw std::runtime_error("Failed writing LIRE GT artifact: " + path);
+}
+
 GroundTruth LoadGroundTruth(const std::string& path,
                             const std::string& base_identity,
                             const std::string& query_identity,
+                            uint64_t base_hash,
+                            uint64_t query_hash,
                             uint32_t query_count,
+                            uint32_t dimension,
                             uint32_t topk,
                             uint32_t initial_rows,
                             uint32_t batch_size,
-                            const std::vector<uint32_t>& expected_frontiers) {
+                            uint32_t configured_final_rows,
+                            const std::vector<uint32_t>& required_frontiers) {
   std::ifstream in(path, std::ios::binary);
-  if (!in) throw std::runtime_error("Unable to open DiSPQ GT artifact: " + path);
+  if (!in) throw std::runtime_error("Unable to open LIRE GT artifact: " + path);
   char magic[8]{};
-  uint32_t nq = 0, k = 0, initial = 0, batch = 0, versions = 0;
-  if (!in.read(magic, sizeof(magic)) || std::string(magic, sizeof(magic)) != "DISPGT01")
-    throw std::runtime_error("Unsupported DiSPQ GT magic/version");
+  uint32_t format_version = 0;
+  if (!in.read(magic, sizeof(magic)) || std::string(magic, sizeof(magic)) != "LIREGT01" ||
+      !ReadNative(in, &format_version) || format_version != 1)
+    throw std::runtime_error("Unsupported LIRE GT magic/version (expected LIREGT01 v1)");
+  const std::string distance_space = ReadArtifactString(in);
   const std::string base = ReadArtifactString(in);
   const std::string query = ReadArtifactString(in);
-  if (!ReadNative(in, &nq) || !ReadNative(in, &k) || !ReadNative(in, &initial) ||
-      !ReadNative(in, &batch) || !ReadNative(in, &versions))
-    throw std::runtime_error("Truncated DiSPQ GT metadata");
-  if (base != base_identity || query != query_identity || nq != query_count ||
+  uint64_t artifact_base_hash = 0, artifact_query_hash = 0;
+  uint32_t metadata[7]{};
+  if (!ReadNative(in, &artifact_base_hash) || !ReadNative(in, &artifact_query_hash) ||
+      !in.read(reinterpret_cast<char*>(metadata), sizeof(metadata)))
+    throw std::runtime_error("Truncated LIRE GT metadata");
+  const uint32_t nq = metadata[0], dim = metadata[1], k = metadata[2];
+  const uint32_t initial = metadata[3], batch = metadata[4];
+  const uint32_t final_rows = metadata[5], versions = metadata[6];
+  if (distance_space != "raw_l2_squared_float32" || base != base_identity ||
+      query != query_identity || artifact_base_hash != base_hash ||
+      artifact_query_hash != query_hash || nq != query_count || dim != dimension ||
       k != topk || initial != initial_rows || batch != batch_size ||
-      versions != expected_frontiers.size()) {
-    throw std::runtime_error("DiSPQ GT metadata mismatch (identity/query/topk/initial/batch/frontier count)");
+      final_rows != configured_final_rows) {
+    throw std::runtime_error("LIRE GT metadata/data identity mismatch");
   }
+  const std::vector<uint32_t> artifact_frontiers =
+      BuildFrontiers(initial, final_rows, batch);
+  if (versions != artifact_frontiers.size())
+    throw std::runtime_error("LIRE GT frontier count mismatch");
   GroundTruth gt;
+  gt.query_count = query_count;
+  gt.topk = topk;
   gt.frontiers.reserve(versions);
-  gt.ids.resize(versions, std::vector<std::vector<uint32_t>>(query_count));
+  gt.ids.resize(static_cast<size_t>(versions) * query_count * topk);
   for (uint32_t version = 0; version < versions; ++version) {
     uint32_t frontier = 0;
-    if (!ReadNative(in, &frontier) || frontier != expected_frontiers[version])
-      throw std::runtime_error("DiSPQ GT frontier mismatch at version " +
+    if (!ReadNative(in, &frontier) || frontier != artifact_frontiers[version])
+      throw std::runtime_error("LIRE GT frontier mismatch at version " +
                                std::to_string(version));
     gt.frontiers.push_back(frontier);
+  }
+  uint64_t payload_hash = kFnvOffset;
+  if (!in.read(reinterpret_cast<char*>(gt.ids.data()),
+               static_cast<std::streamsize>(gt.ids.size() * sizeof(uint32_t))))
+    throw std::runtime_error("Truncated LIRE GT DocId payload");
+  HashBytes(&payload_hash, gt.ids.data(), gt.ids.size() * sizeof(uint32_t));
+  for (uint32_t version = 0; version < versions; ++version) {
     for (uint32_t qi = 0; qi < query_count; ++qi) {
-      auto& row = gt.ids[version][qi];
-      row.resize(topk);
-      if (!in.read(reinterpret_cast<char*>(row.data()),
-                   static_cast<std::streamsize>(topk * sizeof(uint32_t))))
-        throw std::runtime_error("Truncated DiSPQ GT DocId payload");
+      const uint32_t* row = gt.query_row(version, qi);
+      for (uint32_t i = 0; i < topk; ++i) {
+        if (row[i] >= gt.frontiers[version] ||
+            std::find(row, row + i, row[i]) != row + i)
+          throw std::runtime_error("Invalid or duplicate DocId in LIRE GT payload");
+      }
     }
   }
+  uint64_t stored_payload_hash = 0;
+  if (!ReadNative(in, &stored_payload_hash) || stored_payload_hash != payload_hash)
+    throw std::runtime_error("LIRE GT payload checksum mismatch");
   char trailing = 0;
-  if (in.read(&trailing, 1)) throw std::runtime_error("Unexpected trailing bytes in DiSPQ GT artifact");
+  if (in.read(&trailing, 1)) throw std::runtime_error("Unexpected trailing bytes in LIRE GT artifact");
+  for (uint32_t required : required_frontiers) {
+    if (!std::binary_search(gt.frontiers.begin(), gt.frontiers.end(), required))
+      throw std::runtime_error("LIRE GT does not contain required query frontier " +
+                               std::to_string(required));
+  }
   return gt;
 }
 
@@ -361,6 +558,7 @@ void WriteOutputs(const std::string& summary_path,
        << "  \"base\": \"" << JsonEscape(base_path) << "\",\n"
        << "  \"query\": \"" << JsonEscape(query_path) << "\",\n"
        << "  \"gt_artifact\": \"" << JsonEscape(gt_path) << "\",\n"
+       << "  \"gt_distance_space\": \"raw_l2_squared_float32\",\n"
        << "  \"topk\": " << topk << ",\n"
        << "  \"query_workers\": " << query_workers << ",\n"
        << "  \"query_threads_per_request\": " << query_threads_per_request << ",\n"
@@ -488,6 +686,8 @@ int main(int argc, char** argv) {
     bool update_budget_seen = false;
     bool query_workers_seen = false;
     bool deprecated_query_threads_seen = false;
+    bool query_threads_per_request_seen = false;
+    bool prepare_gt = false;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       auto parse_option = [&](uint32_t* out, const std::string& name) {
@@ -497,7 +697,10 @@ int main(int argc, char** argv) {
           throw std::runtime_error(name + " must be in [1, UINT32_MAX]");
         *out = static_cast<uint32_t>(value);
       };
-      if (arg == "--max-insert-vectors") {
+      if (arg == "--prepare-gt") {
+        if (prepare_gt) throw std::runtime_error("--prepare-gt may only be specified once");
+        prepare_gt = true;
+      } else if (arg == "--max-insert-vectors") {
         if (cap_seen || i + 1 >= argc) throw std::runtime_error("--max-insert-vectors requires one value");
         max_insert_vectors = ParseUint64(argv[++i], arg);
         cap_seen = true;
@@ -517,6 +720,7 @@ int main(int argc, char** argv) {
         query_workers_seen = true;
       } else if (arg == "--query-threads-per-request") {
         parse_option(&query_threads_per_request, arg);
+        query_threads_per_request_seen = true;
       } else if (arg == "--query-threads") {
         parse_option(&deprecated_query_threads, arg);
         deprecated_query_threads_seen = true;
@@ -525,10 +729,17 @@ int main(int argc, char** argv) {
       else if (arg.rfind("--", 0) == 0) throw std::runtime_error("Unknown option: " + arg);
       else positional.push_back(arg);
     }
-    if (positional.size() < 3 || positional.size() > 4) {
-      std::cerr << "Usage: faiss_lire_concurrent_eval <config.json> <dataset_dir_or_base.fvecs> <disp_gt> [summary.json] [--max-insert-vectors N] [--query-workers N] [--query-threads-per-request M] [--query-threads N (deprecated alias for --query-workers)] [--insert-threads N] [--maintenance-threads N] [--update-thread-budget N] [--max-maintenance-backlog N] [--insert-rate-limit VECTORS_PER_SEC]\n";
+    if ((prepare_gt && positional.size() != 3) ||
+        (!prepare_gt && (positional.size() < 3 || positional.size() > 4))) {
+      std::cerr << "Usage: faiss_lire_concurrent_eval [--prepare-gt] <config.json> <dataset_dir_or_base.fvecs> <lire_gt.liregt> [summary.json] [--max-insert-vectors N] [--query-workers N] [--query-threads-per-request M] [--query-threads N (deprecated alias for --query-workers)] [--insert-threads N] [--maintenance-threads N] [--update-thread-budget N] [--max-maintenance-backlog N] [--insert-rate-limit VECTORS_PER_SEC]\n";
       return 2;
     }
+    if (prepare_gt && (cap_seen || insert_rate_limit > 0.0 || max_maintenance_backlog > 0 ||
+                       update_budget_seen || query_workers_seen ||
+                       deprecated_query_threads_seen ||
+                       query_threads_per_request_seen || insert_threads > 0 ||
+                       maintenance_threads > 0))
+      throw std::runtime_error("--prepare-gt cannot be combined with workload runtime options");
     if (query_workers_seen && deprecated_query_threads_seen)
       throw std::runtime_error("use either --query-workers or deprecated --query-threads, not both");
     const std::string config_path = positional[0];
@@ -546,20 +757,44 @@ int main(int argc, char** argv) {
     LimitQueries(&query, cfg.max_queries);
     if (base.d != query.d || (cfg.dim && cfg.dim != base.d))
       throw std::runtime_error("base/query/config dimension mismatch");
-    if (query.n == 0 || cfg.topk == 0 || cfg.nprobe == 0 || cfg.nlist == 0)
-      throw std::runtime_error("query count, topk, nprobe and nlist must be positive");
+    if (query.n == 0 || cfg.topk == 0)
+      throw std::runtime_error("query count and topk must be positive");
+    if (!prepare_gt && (cfg.nprobe == 0 || cfg.nlist == 0))
+      throw std::runtime_error("query mode requires positive nprobe and nlist");
     if (cfg.main_index_rows == 0 || cfg.main_index_rows > base.n)
       throw std::runtime_error("main_index_rows must be within the base dataset");
     if (cfg.snapshot_interval == 0) throw std::runtime_error("snapshot_interval must be > 0");
     const uint32_t initial_rows = cfg.main_index_rows;
-    const uint64_t remaining = base.n - initial_rows;
+    const uint32_t configured_final_rows = cfg.final_rows ? cfg.final_rows : base.n;
+    if (configured_final_rows < initial_rows || configured_final_rows > base.n)
+      throw std::runtime_error("final_rows must be within [main_index_rows, base rows]");
+    if (cfg.topk > initial_rows)
+      throw std::runtime_error("topk must not exceed initial_rows for fixed-size LIRE GT rows");
+    if (prepare_gt) {
+      const std::vector<uint32_t> gt_frontiers =
+          BuildFrontiers(initial_rows, configured_final_rows, cfg.snapshot_interval);
+      const GroundTruth gt = ComputeRawL2PrefixGroundTruth(
+          base, query, cfg.topk, gt_frontiers, cfg.gt_threads);
+      SaveGroundTruth(gt_path, NormalizeIdentity(base_path),
+          NormalizeIdentity(query_path), HashFloatPrefix(base, configured_final_rows),
+          HashFloatPrefix(query, query.n), query.n, base.d, cfg.topk,
+          initial_rows, cfg.snapshot_interval, configured_final_rows, gt);
+      std::cout << "[LIRE_GT_PREPARE] distance=raw_l2_squared_float32 base_rows="
+                << configured_final_rows << " queries=" << query.n
+                << " topk=" << cfg.topk << " frontiers=" << gt_frontiers.size()
+                << " threads=" << cfg.gt_threads << " output=" << gt_path
+                << std::endl;
+      return 0;
+    }
     const uint32_t final_rows = static_cast<uint32_t>(initial_rows +
-        std::min<uint64_t>(remaining, max_insert_vectors));
-    std::vector<uint32_t> frontiers{initial_rows};
-    for (uint64_t end = initial_rows; end < final_rows;)
-      frontiers.push_back(static_cast<uint32_t>(end = std::min<uint64_t>(final_rows, end + cfg.snapshot_interval)));
-    const GroundTruth gt = LoadGroundTruth(gt_path, base_path, query_path, query.n,
-        cfg.topk, initial_rows, cfg.snapshot_interval, frontiers);
+        std::min<uint64_t>(configured_final_rows - initial_rows, max_insert_vectors));
+    const std::vector<uint32_t> frontiers =
+        BuildFrontiers(initial_rows, final_rows, cfg.snapshot_interval);
+    const GroundTruth gt = LoadGroundTruth(
+        gt_path, NormalizeIdentity(base_path), NormalizeIdentity(query_path),
+        HashFloatPrefix(base, configured_final_rows), HashFloatPrefix(query, query.n),
+        query.n, base.d, cfg.topk, initial_rows, cfg.snapshot_interval,
+        configured_final_rows, frontiers);
     std::cout << "[INPUT] base=" << base_path << " rows=" << base.n
               << " dim=" << base.d << " queries=" << query.n
               << " topk=" << cfg.topk << " gt=" << gt_path << std::endl;
@@ -684,7 +919,8 @@ int main(int argc, char** argv) {
             const size_t version = static_cast<size_t>(it - gt.frontiers.begin());
             record.gt_version = static_cast<uint32_t>(version);
             record.returned_topk = labels;
-            std::unordered_set<uint32_t> expected(gt.ids[version][qi].begin(), gt.ids[version][qi].end());
+            const uint32_t* gt_row = gt.query_row(version, qi);
+            std::unordered_set<uint32_t> expected(gt_row, gt_row + cfg.topk);
             uint32_t hits = 0;
             for (faiss::idx_t id : labels)
               if (id >= 0 && expected.count(static_cast<uint32_t>(id))) ++hits;

@@ -66,6 +66,7 @@ struct Config {
   uint32_t max_queries{10000};
   uint32_t main_index_rows{200000};
   uint32_t snapshot_interval{10000};
+  uint32_t final_rows{0};
   uint32_t train_rows{0};
   uint32_t seed{1337};
   uint32_t add_threads{0};
@@ -289,6 +290,7 @@ Config LoadConfigJson(const std::string& path) {
   cfg.max_queries = JsonUint(text, "max_queries", cfg.max_queries);
   cfg.main_index_rows = JsonUint(text, "main_index_rows", cfg.main_index_rows);
   cfg.snapshot_interval = JsonUint(text, "snapshot_interval", cfg.snapshot_interval);
+  cfg.final_rows = JsonUint(text, "final_rows", cfg.final_rows);
   cfg.train_rows = JsonUint(text, "train_rows", cfg.train_rows);
   cfg.seed = JsonUint(text, "seed", cfg.seed);
   cfg.add_threads = JsonUint(text, "add_threads", cfg.add_threads);

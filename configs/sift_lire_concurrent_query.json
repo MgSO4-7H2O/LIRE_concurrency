@@ -1,0 +1,22 @@
+{
+  "metric": "l2",
+  "dim": 128,
+  "topk": 10,
+  "nlist": 4096,
+  "nprobe": 16,
+  "train_rows": 210000,
+  "main_index_rows": 210000,
+  "snapshot_interval": 10000,
+  "final_rows": 1000000,
+  "max_queries": 10000,
+  "seed": 1337,
+  "add_threads": 1,
+  "search_threads": 1,
+  "gt_threads": 1,
+  "lire_max_nlist": 8192,
+  "lire_split_threshold": 384,
+  "lire_reassign_k": 64,
+  "lire_max_splits_per_batch": 1000,
+  "lire_enable_reassign": true,
+  "lire_validate_invariants": true
+}

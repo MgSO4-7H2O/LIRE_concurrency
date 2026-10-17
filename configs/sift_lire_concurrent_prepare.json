@@ -1,0 +1,14 @@
+{
+  "metric": "l2",
+  "dim": 128,
+  "topk": 10,
+  "nlist": 4096,
+  "nprobe": 16,
+  "train_rows": 210000,
+  "main_index_rows": 210000,
+  "snapshot_interval": 10000,
+  "final_rows": 1000000,
+  "max_queries": 10000,
+  "seed": 1337,
+  "gt_threads": 16
+}
