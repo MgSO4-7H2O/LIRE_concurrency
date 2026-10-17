@@ -87,6 +87,20 @@ struct Config {
   uint32_t qb{4};
   bool centered{false};
 #if defined(BASELINE_ENABLE_LIRE)
+  std::string concurrent_gt_mode{"load"};
+  std::string concurrent_dataset_path;
+  std::string concurrent_gt_path;
+  std::string concurrent_init_mode{"off"};
+  std::string concurrent_init_path;
+  std::string concurrent_summary_path;
+  uint32_t concurrent_query_workers{8};
+  uint32_t concurrent_query_threads_per_request{1};
+  uint32_t concurrent_insert_threads{1};
+  uint32_t concurrent_maintenance_threads{1};
+  uint32_t concurrent_update_thread_budget{2};
+  uint32_t concurrent_max_maintenance_backlog{0};
+  uint64_t concurrent_max_insert_vectors{std::numeric_limits<uint64_t>::max()};
+  double concurrent_insert_rate_limit{0.0};
   uint32_t lire_max_nlist{0};
   uint32_t lire_split_threshold{0};
   uint32_t lire_reassign_k{64};
@@ -311,6 +325,20 @@ Config LoadConfigJson(const std::string& path) {
   cfg.qb = JsonUint(text, "qb", cfg.qb);
   cfg.centered = JsonBoolDefault(text, "centered", cfg.centered);
 #if defined(BASELINE_ENABLE_LIRE)
+  if (auto v = JsonString(text, "concurrent_gt_mode")) cfg.concurrent_gt_mode = *v;
+  if (auto v = JsonString(text, "concurrent_dataset_path")) cfg.concurrent_dataset_path = *v;
+  if (auto v = JsonString(text, "concurrent_gt_path")) cfg.concurrent_gt_path = *v;
+  if (auto v = JsonString(text, "concurrent_init_mode")) cfg.concurrent_init_mode = *v;
+  if (auto v = JsonString(text, "concurrent_init_path")) cfg.concurrent_init_path = *v;
+  if (auto v = JsonString(text, "concurrent_summary_path")) cfg.concurrent_summary_path = *v;
+  cfg.concurrent_query_workers = JsonUint(text, "concurrent_query_workers", cfg.concurrent_query_workers);
+  cfg.concurrent_query_threads_per_request = JsonUint(text, "concurrent_query_threads_per_request", cfg.concurrent_query_threads_per_request);
+  cfg.concurrent_insert_threads = JsonUint(text, "concurrent_insert_threads", cfg.concurrent_insert_threads);
+  cfg.concurrent_maintenance_threads = JsonUint(text, "concurrent_maintenance_threads", cfg.concurrent_maintenance_threads);
+  cfg.concurrent_update_thread_budget = JsonUint(text, "concurrent_update_thread_budget", cfg.concurrent_update_thread_budget);
+  cfg.concurrent_max_maintenance_backlog = JsonUint(text, "concurrent_max_maintenance_backlog", cfg.concurrent_max_maintenance_backlog);
+  if (auto v = JsonNumber(text, "concurrent_max_insert_vectors")) cfg.concurrent_max_insert_vectors = static_cast<uint64_t>(*v);
+  if (auto v = JsonNumber(text, "concurrent_insert_rate_limit_vecps")) cfg.concurrent_insert_rate_limit = *v;
   cfg.lire_max_nlist = JsonUint(text, "lire_max_nlist", cfg.lire_max_nlist);
   cfg.lire_split_threshold = JsonUint(
       text, "lire_split_threshold", cfg.lire_split_threshold);

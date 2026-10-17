@@ -14,7 +14,7 @@
   "search_threads": 1,
   "gt_threads": 1,
   "lire_max_nlist": 8192,
-  "lire_split_threshold": 384,
+  "lire_split_threshold": 1024,
   "lire_reassign_k": 64,
   "lire_max_splits_per_batch": 1000,
   "lire_enable_reassign": true,

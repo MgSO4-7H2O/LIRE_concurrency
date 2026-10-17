@@ -1,0 +1,2 @@
+[INPUT] base=/home/ydy/data/sift/origin/sift_base.fvecs rows=1000000 dim=128 queries=10000 topk=10 gt=artifacts/sift_lire_raw_l2.liregt
+[TRAIN] start rows=210000 nlist=4096

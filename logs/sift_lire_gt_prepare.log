@@ -1,0 +1,1 @@
+[LIRE_GT_PREPARE] distance=raw_l2_squared_float32 base_rows=1000000 queries=10000 topk=10 frontiers=80 threads=16 output=artifacts/sift_lire_raw_l2.liregt

@@ -122,6 +122,10 @@ class IndexIVFFlatLIRE final : public faiss::IndexIVFFlat {
   void wait_for_maintenance();
   bool wait_for_maintenance_backlog(uint64_t max_pending_jobs);
   void stop_maintenance_workers();
+  void save_initial_state(const std::string& path, uint64_t dataset_hash) const;
+  void load_initial_state(const std::string& path,
+                          faiss::idx_t expected_rows,
+                          uint64_t dataset_hash);
   void reset_maintenance_timeline();
   void validate_consistency();
   faiss::idx_t published_rows() const;

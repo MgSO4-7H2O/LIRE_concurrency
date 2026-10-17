@@ -74,6 +74,21 @@ uint64_t HashFloatPrefix(const FvecsData& data, uint32_t rows) {
   return hash;
 }
 
+uint64_t HashInitialIndexIdentity(const FvecsData& base,
+                                  uint32_t rows,
+                                  const Config& cfg) {
+  uint64_t hash = HashFloatPrefix(base, rows);
+  const uint32_t values[] = {
+      cfg.nlist, cfg.lire_max_nlist ? cfg.lire_max_nlist : cfg.nlist,
+      cfg.train_rows ? std::min(cfg.train_rows, rows) : rows, cfg.seed,
+      cfg.lire_split_threshold, cfg.lire_reassign_k,
+      cfg.lire_max_splits_per_batch,
+      static_cast<uint32_t>(cfg.lire_enable_reassign),
+      static_cast<uint32_t>(cfg.lire_validate_invariants)};
+  HashBytes(&hash, values, sizeof(values));
+  return hash;
+}
+
 std::string NormalizeIdentity(const std::string& path) {
   std::error_code error;
   const auto normalized = std::filesystem::weakly_canonical(path, error);
@@ -675,81 +690,50 @@ int main(int argc, char** argv) {
   using namespace baseline_eval;
   try {
     std::vector<std::string> positional;
-    uint64_t max_insert_vectors = std::numeric_limits<uint64_t>::max();
-    uint64_t max_maintenance_backlog = 0;
-    uint32_t update_thread_budget = 2;
-    double insert_rate_limit = 0.0;
-    uint32_t query_workers_arg = 0, deprecated_query_threads = 0;
-    uint32_t query_threads_per_request = 1;
-    uint32_t insert_threads = 0, maintenance_threads = 0;
-    bool cap_seen = false;
-    bool update_budget_seen = false;
-    bool query_workers_seen = false;
-    bool deprecated_query_threads_seen = false;
-    bool query_threads_per_request_seen = false;
-    bool prepare_gt = false;
-    for (int i = 1; i < argc; ++i) {
-      const std::string arg = argv[i];
-      auto parse_option = [&](uint32_t* out, const std::string& name) {
-        if (i + 1 >= argc) throw std::runtime_error(name + " requires a value");
-        const uint64_t value = ParseUint64(argv[++i], name);
-        if (value == 0 || value > std::numeric_limits<uint32_t>::max())
-          throw std::runtime_error(name + " must be in [1, UINT32_MAX]");
-        *out = static_cast<uint32_t>(value);
-      };
-      if (arg == "--prepare-gt") {
-        if (prepare_gt) throw std::runtime_error("--prepare-gt may only be specified once");
-        prepare_gt = true;
-      } else if (arg == "--max-insert-vectors") {
-        if (cap_seen || i + 1 >= argc) throw std::runtime_error("--max-insert-vectors requires one value");
-        max_insert_vectors = ParseUint64(argv[++i], arg);
-        cap_seen = true;
-      } else if (arg == "--insert-rate-limit") {
-        if (i + 1 >= argc) throw std::runtime_error("--insert-rate-limit requires one value");
-        insert_rate_limit = ParsePositiveDouble(argv[++i], arg);
-      } else if (arg == "--max-maintenance-backlog") {
-        if (i + 1 >= argc) throw std::runtime_error("--max-maintenance-backlog requires one value");
-        max_maintenance_backlog = ParseUint64(argv[++i], arg);
-        if (max_maintenance_backlog == 0)
-          throw std::runtime_error("--max-maintenance-backlog must be > 0");
-      } else if (arg == "--update-thread-budget") {
-        parse_option(&update_thread_budget, arg);
-        update_budget_seen = true;
-      } else if (arg == "--query-workers") {
-        parse_option(&query_workers_arg, arg);
-        query_workers_seen = true;
-      } else if (arg == "--query-threads-per-request") {
-        parse_option(&query_threads_per_request, arg);
-        query_threads_per_request_seen = true;
-      } else if (arg == "--query-threads") {
-        parse_option(&deprecated_query_threads, arg);
-        deprecated_query_threads_seen = true;
-      } else if (arg == "--insert-threads") parse_option(&insert_threads, arg);
-      else if (arg == "--maintenance-threads") parse_option(&maintenance_threads, arg);
-      else if (arg.rfind("--", 0) == 0) throw std::runtime_error("Unknown option: " + arg);
-      else positional.push_back(arg);
-    }
-    if ((prepare_gt && positional.size() != 3) ||
-        (!prepare_gt && (positional.size() < 3 || positional.size() > 4))) {
-      std::cerr << "Usage: faiss_lire_concurrent_eval [--prepare-gt] <config.json> <dataset_dir_or_base.fvecs> <lire_gt.liregt> [summary.json] [--max-insert-vectors N] [--query-workers N] [--query-threads-per-request M] [--query-threads N (deprecated alias for --query-workers)] [--insert-threads N] [--maintenance-threads N] [--update-thread-budget N] [--max-maintenance-backlog N] [--insert-rate-limit VECTORS_PER_SEC]\n";
+    for (int i = 1; i < argc; ++i) positional.emplace_back(argv[i]);
+    if (positional.size() != 1) {
+      std::cerr << "Usage: faiss_lire_concurrent_eval <config.json>\n";
       return 2;
     }
-    if (prepare_gt && (cap_seen || insert_rate_limit > 0.0 || max_maintenance_backlog > 0 ||
-                       update_budget_seen || query_workers_seen ||
-                       deprecated_query_threads_seen ||
-                       query_threads_per_request_seen || insert_threads > 0 ||
-                       maintenance_threads > 0))
-      throw std::runtime_error("--prepare-gt cannot be combined with workload runtime options");
-    if (query_workers_seen && deprecated_query_threads_seen)
-      throw std::runtime_error("use either --query-workers or deprecated --query-threads, not both");
     const std::string config_path = positional[0];
     Config cfg = LoadConfigJson(config_path);
-    const std::string base_path = ResolveFileWithSuffix(positional[1], "_base.fvecs");
+    const bool prepare_gt = cfg.concurrent_gt_mode == "prepare";
+    const bool load_gt = cfg.concurrent_gt_mode == "load";
+    const bool prepare_index = cfg.concurrent_init_mode == "prepare";
+    const bool load_index = cfg.concurrent_init_mode == "load";
+    if (!prepare_gt && !load_gt && cfg.concurrent_gt_mode != "off")
+      throw std::runtime_error("concurrent_gt_mode must be prepare, load, or off");
+    if (!prepare_index && !load_index && cfg.concurrent_init_mode != "off")
+      throw std::runtime_error("concurrent_init_mode must be prepare, load, or off");
+    if (cfg.concurrent_query_workers == 0 || cfg.concurrent_query_threads_per_request == 0 ||
+        cfg.concurrent_insert_threads == 0 || cfg.concurrent_maintenance_threads == 0 ||
+        cfg.concurrent_update_thread_budget == 0)
+      throw std::runtime_error("concurrent thread counts and update budget must be positive");
+    if (!std::isfinite(cfg.concurrent_insert_rate_limit) ||
+        cfg.concurrent_insert_rate_limit < 0.0)
+      throw std::runtime_error("concurrent_insert_rate_limit_vecps must be finite and non-negative");
+    uint64_t max_insert_vectors = cfg.concurrent_max_insert_vectors;
+    uint64_t max_maintenance_backlog = cfg.concurrent_max_maintenance_backlog;
+    uint32_t update_thread_budget = cfg.concurrent_update_thread_budget;
+    double insert_rate_limit = cfg.concurrent_insert_rate_limit;
+    uint32_t query_threads_per_request = cfg.concurrent_query_threads_per_request;
+    uint32_t insert_threads = cfg.concurrent_insert_threads;
+    uint32_t maintenance_threads = cfg.concurrent_maintenance_threads;
+    bool cap_seen = max_insert_vectors != std::numeric_limits<uint64_t>::max();
+    const uint32_t query_workers_arg = cfg.concurrent_query_workers;
+    if (cfg.concurrent_dataset_path.empty())
+      throw std::runtime_error("concurrent_dataset_path is required");
+    const std::string base_path = ResolveFileWithSuffix(cfg.concurrent_dataset_path, "_base.fvecs");
     const std::string query_path = ResolveFileWithSuffix(
         std::filesystem::path(base_path).parent_path().string(), "_query.fvecs");
-    const std::string gt_path = positional[2];
-    const std::string summary_path = positional.size() == 4 ? positional[3] :
+    const std::string gt_path = cfg.concurrent_gt_path;
+    const std::string init_path = cfg.concurrent_init_path;
+    const std::string summary_path = !cfg.concurrent_summary_path.empty() ? cfg.concurrent_summary_path :
         (std::filesystem::path("result") / (std::filesystem::path(config_path).stem().string() + "_concurrent.json")).string();
+    if ((prepare_gt || load_gt) && gt_path.empty())
+      throw std::runtime_error("concurrent_gt_path is required when GT mode is prepare/load");
+    if ((prepare_index || load_index) && init_path.empty())
+      throw std::runtime_error("concurrent_init_path is required when init mode is prepare/load");
     if (cfg.metric != "l2" && cfg.metric != "L2")
       throw std::runtime_error("The first concurrent LIRE evaluator supports L2 only");
     FvecsData base = LoadFvecs(base_path);
@@ -786,15 +770,20 @@ int main(int argc, char** argv) {
                 << std::endl;
       return 0;
     }
+    if (!load_gt && !prepare_index)
+      throw std::runtime_error("query evaluation requires concurrent_gt_mode=load");
     const uint32_t final_rows = static_cast<uint32_t>(initial_rows +
         std::min<uint64_t>(configured_final_rows - initial_rows, max_insert_vectors));
     const std::vector<uint32_t> frontiers =
         BuildFrontiers(initial_rows, final_rows, cfg.snapshot_interval);
-    const GroundTruth gt = LoadGroundTruth(
-        gt_path, NormalizeIdentity(base_path), NormalizeIdentity(query_path),
-        HashFloatPrefix(base, configured_final_rows), HashFloatPrefix(query, query.n),
-        query.n, base.d, cfg.topk, initial_rows, cfg.snapshot_interval,
-        configured_final_rows, frontiers);
+    GroundTruth gt;
+    if (load_gt) {
+      gt = LoadGroundTruth(
+          gt_path, NormalizeIdentity(base_path), NormalizeIdentity(query_path),
+          HashFloatPrefix(base, configured_final_rows), HashFloatPrefix(query, query.n),
+          query.n, base.d, cfg.topk, initial_rows, cfg.snapshot_interval,
+          configured_final_rows, frontiers);
+    }
     std::cout << "[INPUT] base=" << base_path << " rows=" << base.n
               << " dim=" << base.d << " queries=" << query.n
               << " topk=" << cfg.topk << " gt=" << gt_path << std::endl;
@@ -813,9 +802,9 @@ int main(int argc, char** argv) {
         static_cast<uint64_t>(lire.insert_threads) + lire.maintenance_threads;
     if (actual_update_threads > update_thread_budget) {
       throw std::runtime_error(
-          "insert_threads + maintenance_threads exceeds --update-thread-budget " +
+          "concurrent_insert_threads + concurrent_maintenance_threads exceeds concurrent_update_thread_budget " +
           std::to_string(update_thread_budget) +
-          (update_budget_seen ? "" : " (default is 2; specify the shared budget explicitly)"));
+          " (set the shared budget in the config)");
     }
     if (max_maintenance_backlog == 0) {
       max_maintenance_backlog = std::max<uint64_t>(
@@ -826,30 +815,50 @@ int main(int argc, char** argv) {
     lire.validate_invariants = cfg.lire_validate_invariants;
     IndexIVFFlatLIRE index(static_cast<int>(base.d), lire);
     index.nprobe = std::min<faiss::idx_t>(cfg.nprobe, lire.initial_nlist);
-    const uint32_t train_rows = cfg.train_rows ? std::min(cfg.train_rows, initial_rows) : initial_rows;
-    if (train_rows < cfg.nlist)
-      throw std::runtime_error("train_rows must be at least nlist for IVF training");
-    std::cout << "[TRAIN] start rows=" << train_rows << " nlist=" << cfg.nlist
-              << std::endl;
-    const auto train_start = std::chrono::steady_clock::now();
-    index.train(train_rows, RowPtr(base, 0));
-    const double train_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - train_start).count();
-    std::cout << "[TRAIN] complete elapsed_ms=" << train_ms << std::endl;
-    std::vector<faiss::idx_t> initial_ids(initial_rows);
-    std::iota(initial_ids.begin(), initial_ids.end(), 0);
-    std::cout << "[INITIAL_INSERT] start rows=0.." << initial_rows << std::endl;
-    index.add_with_ids(initial_rows, RowPtr(base, 0), initial_ids.data());
-    index.start_maintenance_workers();
-    index.wait_for_maintenance();
-    if (lire.validate_invariants) index.validate_consistency();
-    index.sample_oversized_active_lists(true);
-    index.reset_maintenance_timeline();
-    std::cout << "[INITIAL_INSERT] complete published_rows="
-              << index.published_rows() << std::endl;
+    if (load_index) {
+      index.load_initial_state(init_path, initial_rows,
+                               HashInitialIndexIdentity(base, initial_rows, cfg));
+      index.start_maintenance_workers();
+      index.sample_oversized_active_lists(true);
+      index.reset_maintenance_timeline();
+      std::cout << "[INITIAL_INDEX] loaded rows=" << initial_rows
+                << " artifact=" << init_path << std::endl;
+    } else {
+      const uint32_t train_rows = cfg.train_rows ? std::min(cfg.train_rows, initial_rows) : initial_rows;
+      if (train_rows < cfg.nlist)
+        throw std::runtime_error("train_rows must be at least nlist for IVF training");
+      std::cout << "[TRAIN] start rows=" << train_rows << " nlist=" << cfg.nlist
+                << std::endl;
+      const auto train_start = std::chrono::steady_clock::now();
+      index.train(train_rows, RowPtr(base, 0));
+      const double train_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - train_start).count();
+      std::cout << "[TRAIN] complete elapsed_ms=" << train_ms << std::endl;
+      std::vector<faiss::idx_t> initial_ids(initial_rows);
+      std::iota(initial_ids.begin(), initial_ids.end(), 0);
+      std::cout << "[INITIAL_INSERT] start rows=0.." << initial_rows << std::endl;
+      index.add_with_ids(initial_rows, RowPtr(base, 0), initial_ids.data());
+      index.start_maintenance_workers();
+      index.wait_for_maintenance();
+      if (lire.validate_invariants) index.validate_consistency();
+      index.sample_oversized_active_lists(true);
+      index.reset_maintenance_timeline();
+      std::cout << "[INITIAL_INSERT] complete published_rows="
+                << index.published_rows() << std::endl;
+      if (prepare_index) {
+        const std::filesystem::path artifact_path(init_path);
+        if (!artifact_path.parent_path().empty())
+          std::filesystem::create_directories(artifact_path.parent_path());
+        index.save_initial_state(init_path,
+                                 HashInitialIndexIdentity(base, initial_rows, cfg));
+        index.stop_maintenance_workers();
+        std::cout << "[INITIAL_INDEX_PREPARE] rows=" << initial_rows
+                  << " output=" << init_path << std::endl;
+        return 0;
+      }
+    }
 
-    const uint32_t query_workers = query_workers_seen ? query_workers_arg :
-        (deprecated_query_threads_seen ? deprecated_query_threads : 1);
+    const uint32_t query_workers = query_workers_arg;
     const uint64_t query_thread_budget =
         static_cast<uint64_t>(query_workers) * query_threads_per_request;
     std::vector<std::unique_ptr<QuerySearchTeam>> query_teams;

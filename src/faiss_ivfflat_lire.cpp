@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <filesystem>
 #include <limits>
 #include <iostream>
 #include <mutex>
@@ -1302,6 +1304,106 @@ void IndexIVFFlatLIRE::train(faiss::idx_t n, const float* x) {
   maintenance_epoch_ = std::chrono::steady_clock::now();
   rebuild_quantizer();
   is_trained = true;
+}
+
+void IndexIVFFlatLIRE::save_initial_state(const std::string& path,
+                                           uint64_t dataset_hash) const {
+  std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
+  if (!is_trained || ntotal <= 0 || published_rows_.load() != ntotal)
+    throw std::runtime_error("cannot save an incomplete LIRE initial index");
+  std::ofstream out(path, std::ios::binary);
+  if (!out) throw std::runtime_error("unable to write LIRE index artifact: " + path);
+  out.write("LIREIX01", 8);
+  const uint32_t metadata[] = {static_cast<uint32_t>(d), initial_nlist_,
+      max_nlist_, active_nlist_};
+  out.write(reinterpret_cast<const char*>(metadata), sizeof(metadata));
+  const faiss::idx_t rows = ntotal;
+  out.write(reinterpret_cast<const char*>(&rows), sizeof(rows));
+  out.write(reinterpret_cast<const char*>(&dataset_hash), sizeof(dataset_hash));
+  out.write(reinterpret_cast<const char*>(centroids_.data()),
+      static_cast<std::streamsize>(centroids_.size() * sizeof(float)));
+  out.write(reinterpret_cast<const char*>(active_.data()),
+      static_cast<std::streamsize>(active_.size()));
+  for (uint32_t slot = 0; slot < max_nlist_; ++slot) {
+    const size_t count = invlists->list_size(slot);
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    if (!count) continue;
+    const faiss::idx_t* ids = invlists->get_ids(slot);
+    const uint8_t* codes = invlists->get_codes(slot);
+    out.write(reinterpret_cast<const char*>(ids),
+        static_cast<std::streamsize>(count * sizeof(faiss::idx_t)));
+    out.write(reinterpret_cast<const char*>(codes),
+        static_cast<std::streamsize>(count * static_cast<size_t>(d) * sizeof(float)));
+    invlists->release_ids(slot, ids);
+    invlists->release_codes(slot, codes);
+  }
+  out.flush();
+  if (!out) throw std::runtime_error("failed writing LIRE index artifact: " + path);
+}
+
+void IndexIVFFlatLIRE::load_initial_state(const std::string& path,
+                                           faiss::idx_t expected_rows,
+                                           uint64_t dataset_hash) {
+  std::lock_guard<std::mutex> insert_lock(insert_mutex_);
+  std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error("unable to open LIRE index artifact: " + path);
+  char magic[8]{};
+  uint32_t metadata[4]{};
+  faiss::idx_t rows = 0;
+  uint64_t artifact_dataset_hash = 0;
+  if (!in.read(magic, sizeof(magic)) || std::string(magic, 8) != "LIREIX01" ||
+      !in.read(reinterpret_cast<char*>(metadata), sizeof(metadata)) ||
+      !in.read(reinterpret_cast<char*>(&rows), sizeof(rows)) ||
+      !in.read(reinterpret_cast<char*>(&artifact_dataset_hash), sizeof(artifact_dataset_hash)))
+    throw std::runtime_error("invalid or truncated LIRE index artifact");
+  if (metadata[0] != static_cast<uint32_t>(d) || metadata[1] != initial_nlist_ ||
+      metadata[2] != max_nlist_ || metadata[3] < initial_nlist_ ||
+      metadata[3] > max_nlist_ || artifact_dataset_hash != dataset_hash ||
+      rows != expected_rows || ntotal != 0)
+    throw std::runtime_error("LIRE index artifact configuration/row mismatch");
+  if (!in.read(reinterpret_cast<char*>(centroids_.data()),
+      static_cast<std::streamsize>(centroids_.size() * sizeof(float))) ||
+      !in.read(reinterpret_cast<char*>(active_.data()),
+      static_cast<std::streamsize>(active_.size())))
+    throw std::runtime_error("truncated LIRE index topology");
+  std::fill(membership_.begin(), membership_.end(), -1);
+  membership_.resize(static_cast<size_t>(rows), -1);
+  uint64_t total = 0;
+  free_slots_.clear();
+  active_nlist_ = 0;
+  for (uint32_t slot = 0; slot < max_nlist_; ++slot) {
+    if (active_[slot] > 1)
+      throw std::runtime_error("invalid active-list marker in LIRE index artifact");
+    if (active_[slot]) ++active_nlist_;
+    else free_slots_.push_back(static_cast<faiss::idx_t>(slot));
+    size_t count = 0;
+    if (!in.read(reinterpret_cast<char*>(&count), sizeof(count)) || count > static_cast<size_t>(rows))
+      throw std::runtime_error("invalid LIRE index list size");
+    std::vector<faiss::idx_t> ids(count);
+    std::vector<float> vectors(count * static_cast<size_t>(d));
+    if (count && (!in.read(reinterpret_cast<char*>(ids.data()),
+          static_cast<std::streamsize>(ids.size() * sizeof(faiss::idx_t))) ||
+        !in.read(reinterpret_cast<char*>(vectors.data()),
+          static_cast<std::streamsize>(vectors.size() * sizeof(float)))))
+      throw std::runtime_error("truncated LIRE index list data");
+    for (faiss::idx_t id : ids) {
+      if (id < 0 || id >= rows || membership_[static_cast<size_t>(id)] != -1)
+        throw std::runtime_error("invalid or duplicate ID in LIRE index artifact");
+      membership_[static_cast<size_t>(id)] = slot;
+    }
+    total += count;
+    write_list(slot, ListData{std::move(ids), std::move(vectors)});
+  }
+  char trailing;
+  if (active_nlist_ != metadata[3] || total != static_cast<uint64_t>(rows) ||
+      std::find(membership_.begin(), membership_.end(), -1) != membership_.end() ||
+      in.read(&trailing, 1))
+    throw std::runtime_error("LIRE index artifact payload mismatch");
+  ntotal = rows;
+  published_rows_.store(rows, std::memory_order_release);
+  is_trained = true;
+  rebuild_quantizer();
 }
 
 void IndexIVFFlatLIRE::add_with_ids(

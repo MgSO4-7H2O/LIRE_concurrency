@@ -9,34 +9,42 @@ in-flight queries. It records the streaming workload end at that point, then
 drains residual maintenance separately. That residual drain is excluded from
 query count, QPS, latency, recall, progress, and streaming workload duration.
 
-The SIFT1M workflow uses an independent Raw-L2 exact GT. Prepare it offline
-before starting the concurrent evaluator:
+The configuration selects one of three offline/runtime modes. GT and initial
+index paths, query/insert/maintenance thread allocation, update thread budget,
+maintenance backlog, insert pacing, and summary output path are all read from
+JSON, including `concurrent_dataset_path`. Runtime options are no longer
+passed on the command line. For SIFT1M:
 
 ```bash
 mkdir -p artifacts result
-./build/faiss_lire_concurrent_eval --prepare-gt \
-  configs/sift_lire_concurrent_prepare.json \
-  /home/ydy/data/sift/origin \
-  artifacts/sift_lire_raw_l2.liregt
+./build-concurrent/faiss_lire_concurrent_eval \
+  configs/sift1m_concurrent_gt_prepare.json
 ```
 
-Then load that artifact for the concurrent query/insert/maintenance run:
+Prepare and persist the fully built initial index (`main_index_rows`) separately:
 
 ```bash
-./build/faiss_lire_concurrent_eval \
-  configs/sift_lire_concurrent_query.json \
-  /home/ydy/data/sift/origin \
-  artifacts/sift_lire_raw_l2.liregt \
-  result/sift1m_concurrent_lire_raw_l2.json \
-  --query-workers 8 \
-  --query-threads-per-request 3 \
-  --insert-threads 1 \
-  --maintenance-threads 6 \
-  --update-thread-budget 7 \
-  --insert-rate-limit 12000
+./build-concurrent/faiss_lire_concurrent_eval \
+  configs/sift1m_concurrent_init_prepare.json
 ```
 
-`--prepare-gt` computes exact squared-L2 over the original float32 rows,
+The query config loads both artifacts and starts at the initial frontier without
+training or inserting those initial rows again:
+
+```bash
+./build-concurrent/faiss_lire_concurrent_eval \
+  configs/sift1m_concurrent_query.json
+```
+
+Set `concurrent_gt_mode` to `prepare`, `load`, or `off`, and
+`concurrent_init_mode` to `prepare`, `load`, or `off`. Query runs use `load`
+for both. An init preparation uses GT `off` and init `prepare`; GT preparation
+uses GT `prepare` and init `off`. `concurrent_gt_path` and
+`concurrent_init_path` specify the artifacts. The initial index artifact stores
+the complete LIRE list/topology state and validates the base prefix hash,
+dimension, list capacities, and row count when loaded.
+
+GT prepare mode computes exact squared-L2 over the original float32 rows,
 `sum((q[i] - x[i])^2)`, with no whitening, normalization, PQ, or IVF search.
 For each query it scans only rows added since the previous frontier and
 maintains an exact top-k heap, snapshotting the ordered IDs at each frontier.
@@ -48,42 +56,37 @@ sequence, per-frontier DocIds, and a payload checksum. The query evaluator only
 loads `LIREGT01`; it rejects DiSPQ GT files, mismatched metadata/data/frontiers,
 corrupt payloads, and trailing bytes without fallback.
 
-The prepare and query configs share `topk`, `main_index_rows`,
+The GT prepare and query configs share `topk`, `main_index_rows`,
 `snapshot_interval`, and `final_rows`. Queries capture `published_rows()` once
 and compare their results only with the exact GT for that same frontier.
 Maintenance changes list organization but never advances the GT frontier.
 
-For a smaller run, `--max-insert-vectors` may be used if the resulting final
-frontier is present in the prepared artifact; an incompatible partial batch
-frontier is rejected.
+Thread allocation uses `concurrent_query_workers`,
+`concurrent_query_threads_per_request`, `concurrent_insert_threads`, and
+`concurrent_maintenance_threads`. Set `concurrent_update_thread_budget` to at
+least the sum of the insert and maintenance threads. The external pacing cap
+uses `concurrent_insert_rate_limit_vecps`; `concurrent_max_insert_vectors` can
+limit a run to a prepared GT frontier.
 
 Build command:
 
 ```bash
-cmake --build build -j
+cmake --build build-concurrent --target faiss_lire_concurrent_eval -j
 ```
 
-Existing general command shape:
+Command shape:
 
 ```bash
-./build/faiss_lire_concurrent_eval CONFIG.json DATASET_DIR LIRE_GT.liregt SUMMARY.json \
-  --max-insert-vectors 30000 \
-  --query-workers 8 \
-  --query-threads-per-request 3 \
-  --insert-threads 1 \
-  --maintenance-threads 3 \
-  --update-thread-budget 4 \
-  --insert-rate-limit 10000 \
-  --max-maintenance-backlog 6
+./build-concurrent/faiss_lire_concurrent_eval CONFIG.json
 ```
 
-Align `--query-workers` and `--query-threads-per-request` with the DiSPQ
-configuration, as well as the external insert rate cap. `--query-workers N`
+Align `concurrent_query_workers` and
+`concurrent_query_threads_per_request` with the DiSPQ configuration, as well
+as the external insert rate cap. `concurrent_query_workers N`
 means N concurrent logical query requests. Each request uses a fixed search
-team of `--query-threads-per-request M` threads, so its Query-side budget is
-N × M. The deprecated `--query-threads N` remains an alias for
-`--query-workers N`; it does not configure per-request parallelism. Query
-resources do not change when the update-side split changes.
+team of `concurrent_query_threads_per_request M` threads, so its Query-side
+budget is N × M. Query resources do not change when the update-side split
+changes.
 
 Each query team is created before the streaming workload and reused for every
 request handled by its outer query worker. The calling worker is team member
@@ -99,16 +102,14 @@ the current serial scan path is retained. The logged `query_thread_budget` is
 `query_workers × query_threads_per_request`; helper work is not counted as
 additional logical queries.
 
-`--insert-threads N` configures the Faiss/OpenMP
+`concurrent_insert_threads` configures the Faiss/OpenMP
 coarse assignment inside the single foreground insert stream; it does not
-create N frontend insert workers. `--maintenance-threads N` starts N LIRE
-background workers. `--update-thread-budget` checks that
+create N frontend insert workers. `concurrent_maintenance_threads` starts N
+LIRE background workers. `concurrent_update_thread_budget` checks that
 `insert_threads + maintenance_threads` does not exceed the update-side CPU
 budget. Query workers are accounted for separately. Faiss/OpenMP nested
 parallelism is disabled for the insert assignment region; maintenance jobs do
-not create nested OpenMP teams. If omitted, the update-side budget defaults to
-2, matching the default one insert thread plus one maintenance thread; larger
-thread splits require an explicit budget.
+not create nested OpenMP teams.
 
 The external insert rate is a batch-arrival cap in vectors per second. For
 batch size B and rate R, successive batch release times are spaced by B/R
@@ -118,14 +119,14 @@ release schedule restarts from that admission point, as it does in DiSPQ.
 Measured `insert_throughput_vecps` remains the actual time spent in
 `add_with_ids()` and is not the configured arrival rate.
 
-`--max-maintenance-backlog N` bounds the combined pending SplitJob and
+`concurrent_max_maintenance_backlog` bounds the combined pending SplitJob and
 ReassignJob queue before admitting the next dynamic batch. When the queue
 exceeds N, the foreground stream waits until it falls to N or fewer; Query and
 maintenance continue during that wait. Split jobs for the same physical list
 are deduplicated. One split can enqueue many per-vector reassignments, so the
 queue can briefly exceed the threshold by that split's fan-out; the threshold
-gates subsequent batch admission. If omitted, the threshold is twice the
-number of maintenance workers (minimum one).
+gates subsequent batch admission. A value of zero selects twice the number of
+maintenance workers (minimum one).
 
 The internal maintenance pipeline follows SPFresh/LIRE's split and
 reassignment shape. A SplitJob locks its source posting and a reserved child
@@ -201,9 +202,11 @@ conditions, and local publication remain LIRE-specific. This evaluator supports
 raw L2 fvecs and insert-only workloads; deletion and plotting are not
 implemented. AVX and formal performance tuning remain deferred.
 
-For small functional checks, use `--max-insert-vectors`, `--query-workers 2`
-or `4`, `--query-threads-per-request 1` or `3`, `--insert-threads 1`, and a maintenance-thread count that fits the
-update budget. Enable `lire_validate_invariants` in a small run to validate
+For small functional checks, set `concurrent_max_insert_vectors`,
+`concurrent_query_workers` to `2` or `4`,
+`concurrent_query_threads_per_request` to `1` or `3`, and choose insert and
+maintenance thread counts that fit the update budget. Enable
+`lire_validate_invariants` in a small run to validate
 membership and inverted-list consistency after initial build and final
 maintenance drain. The supplied SIFT1M candidate config uses 4,096 lists,
 210,000 initial rows, 10,000-row batches, `lire_split_threshold=384`, and
